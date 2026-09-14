@@ -1,10 +1,21 @@
 #!/usr/bin/env bash
 # Source this file in every shell used to inspect/control HG-DAGGER nodes.
 
+hg_dagger_restore_nounset=0
+case "$-" in
+  *u*) hg_dagger_restore_nounset=1 ;;
+esac
+
 set +u
 source /opt/ros/jazzy/setup.bash
 source /home/ubuntu/ros2_ws/install/setup.bash
-set -u
+
+if [ "${hg_dagger_restore_nounset}" -eq 1 ]; then
+  set -u
+else
+  set +u
+fi
+unset hg_dagger_restore_nounset
 
 export ROS_DOMAIN_ID=0
 export ROBOT_ID="${HG_DAGGER_ROBOT_ID:-${ROBOT_ID:-328}}"
