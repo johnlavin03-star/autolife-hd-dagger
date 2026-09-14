@@ -1,0 +1,27 @@
+# Credentials and local configuration
+*.token
+server.token
+.env
+.env.*
+
+# Python / ROS build products
+__pycache__/
+*.py[cod]
+.pytest_cache/
+build/
+install/
+log/
+
+# Runtime data
+*.log
+hg_dagger_data/
+datasets/
+dataset/
+outputs/
+
+# Local backups and editor state
+codex-history-backup-*/
+**/.codex_backups/
+.vscode/
+.idea/
+

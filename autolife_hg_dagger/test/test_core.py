@@ -1,0 +1,72 @@
+import pytest
+
+from autolife_hg_dagger.core import (
+    AuthorityStateMachine,
+    Mode,
+    both_grips_released,
+    grip_snapshot,
+    left_y_snapshot,
+    policy_to_controller,
+)
+
+
+def test_hg_dagger_recovery_cycle():
+    machine = AuthorityStateMachine()
+    assert machine.enable().new == Mode.POLICY_ACTIVE
+    assert machine.failure().new == Mode.FAILURE_HOLD
+    assert machine.hold_confirmed().new == Mode.EXPERT_RELEASE_REQUIRED
+    assert machine.expert_release_confirmed().new == Mode.EXPERT_READY
+    assert machine.expert_first_command().new == Mode.EXPERT_ACTIVE
+    assert machine.resume().new == Mode.POLICY_WARMUP
+    assert machine.warmup_complete().new == Mode.POLICY_ACTIVE
+    assert machine.authority_epoch == 7
+
+
+def test_expert_cannot_become_ready_before_release_confirmation():
+    machine = AuthorityStateMachine()
+    machine.enable()
+    machine.failure()
+    machine.hold_confirmed()
+    with pytest.raises(ValueError):
+        machine.expert_first_command()
+    assert machine.expert_release_confirmed().new == Mode.EXPERT_READY
+
+
+def test_invalid_takeover_is_rejected():
+    machine = AuthorityStateMachine()
+    with pytest.raises(ValueError):
+        machine.failure()
+
+
+def test_policy_action_contract():
+    controller, action = policy_to_controller({"action": list(range(16)), "units": "degrees"})
+    assert controller["left_arm_target_joints_position"] == list(range(7))
+    assert controller["right_arm_target_joints_position"] == list(range(7, 14))
+    assert action[14:] == [14.0, 15.0]
+
+
+def test_groot_21d_policy_action_contract_preserves_unmodelled_lower_body():
+    controller, action = policy_to_controller({
+        "action": list(range(21)),
+        "units": "degrees",
+        "measured_leg_waist": [101, 102, 103, 104],
+    })
+    assert controller["leg_waist_target_joints_position"] == [101.0, 102.0, 19.0, 20.0]
+    assert controller["neck_target_joints_position"] == [16.0, 17.0, 18.0]
+    assert len(action) == 21
+
+
+@pytest.mark.parametrize("action", [[0.0] * 15, [0.0] * 15 + [float("nan")]])
+def test_invalid_policy_action(action):
+    with pytest.raises(ValueError):
+        policy_to_controller({"action": action})
+
+
+def test_vr_gestures_from_existing_web_payload():
+    packet = {
+        "leftController": {"gripActive": True, "yButton": 1},
+        "rightController": {"gripActive": False},
+    }
+    assert grip_snapshot(packet) == (True, False)
+    assert left_y_snapshot(packet)
+    assert not both_grips_released(packet)

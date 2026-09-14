@@ -1,0 +1,24 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>autolife_hg_dagger</name>
+  <version>0.1.0</version>
+  <description>Independent HG-DAgger authority, timing and recording adapter for Autolife VR teleoperation.</description>
+  <maintainer email="ubuntu@example.com">Autolife Robotics</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_python</buildtool_depend>
+  <depend>rclpy</depend>
+  <depend>std_msgs</depend>
+  <depend>std_srvs</depend>
+  <depend>ament_index_python</depend>
+  <exec_depend>python3-numpy</exec_depend>
+  <exec_depend>python3-opencv</exec_depend>
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+  <test_depend>ament_pytest</test_depend>
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>
