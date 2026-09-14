@@ -45,7 +45,7 @@ colcon build --packages-select autolife_hg_dagger --symlink-install
 source install/setup.bash
 bash src/autolife_hg_dagger/scripts/setup_hg_web_env.sh
 ros2 launch autolife_hg_dagger hg_dagger_vr.launch.py \
-  dry_run:=true task_name:=my_task data_root:=/path/to/hg_data
+  dry_run:=true robot_id:=328 task_name:=my_task data_root:=/path/to/hg_data
 ```
 
 ### THOR GR00T N1.7 bridge
@@ -68,7 +68,7 @@ mkdir -p /home/ubuntu/.config/autolife_hg_dagger
 chmod 600 /home/ubuntu/.config/autolife_hg_dagger/groot_server.token
 
 ros2 launch autolife_hg_dagger hg_dagger_vr.launch.py \
-  dry_run:=true start_groot_bridge:=true \
+  dry_run:=true robot_id:=328 start_groot_bridge:=true \
   groot_server_url:=http://192.168.8.179:8777 \
   groot_token_file:=/home/ubuntu/.config/autolife_hg_dagger/groot_server.token \
   groot_task:='Pick the laundry bag.' \
@@ -104,6 +104,17 @@ ros2 service call /hg_dagger/set_session_enabled std_srvs/srv/SetBool "{data: tr
 ```bash
 bash /home/ubuntu/ros2_ws/src/autolife_hg_dagger/scripts/start_hg_collectors.sh \
   my_task "任务文本" /path/to/hg_data
+```
+
+在其他机器人上同时设置 `HG_DAGGER_ROBOT_ID` 和 launch 的 `robot_id`。例如 307：
+
+```bash
+export HG_DAGGER_ROBOT_ID=307
+bash /home/ubuntu/ros2_ws/src/autolife-hd-dagger/autolife_hg_dagger/scripts/start_hg_collectors.sh \
+  my_task "任务文本" /path/to/hg_data
+
+ros2 launch autolife_hg_dagger hg_dagger_vr.launch.py \
+  robot_id:=307 dry_run:=true task_name:=my_task data_root:=/path/to/hg_data
 ```
 
 数据目录是 `/path/to/hg_data/my_task/hg_dagger_rgbd/dataset`；控制 FIFO 位于其父目录。collector 和 launch 必须使用同一个 `data_root`。

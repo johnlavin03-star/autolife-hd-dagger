@@ -35,6 +35,7 @@ def generate_launch_description():
     cyclonedds_uri = LaunchConfiguration("cyclonedds_uri")
     data_root = LaunchConfiguration("data_root")
     task_name = LaunchConfiguration("task_name")
+    robot_id = LaunchConfiguration("robot_id")
     start_groot_bridge = LaunchConfiguration("start_groot_bridge")
     groot_server_url = LaunchConfiguration("groot_server_url")
     groot_token_file = LaunchConfiguration("groot_token_file")
@@ -53,6 +54,12 @@ def generate_launch_description():
                 data_root, task_name, "hg_dagger_rgb", ".official_recording_control"]),
             "rgbd_collector_fifo": PathJoinSubstitution([
                 data_root, task_name, "hg_dagger_rgbd", ".official_recording_control"]),
+            "vendor_joint_command_topic": ParameterValue([
+                "/topic_arm_whole_body_target_joints_position_0_", robot_id
+            ], value_type=str),
+            "vendor_gripper_command_topic": ParameterValue([
+                "/topic_arm_gripper_target_joints_position_0_", robot_id
+            ], value_type=str),
         }],
     )
 
@@ -62,7 +69,7 @@ def generate_launch_description():
         name="independent_arm_controller_306_v4",
         output="screen",
         parameters=[controller_config, {
-            "topic_suffix": "0_328",
+            "topic_suffix": ParameterValue(["0_", robot_id], value_type=str),
             "dry_run": ParameterValue(dry_run, value_type=bool),
             "reset_before_hardware_enable": False,
             "quick_reset_after_hardware_enable": False,
@@ -90,7 +97,7 @@ def generate_launch_description():
         name="independent_vr_mapper_306_v4",
         output="screen",
         parameters=[teleop_config, {
-            "topic_suffix": "0_328",
+            "topic_suffix": ParameterValue(["0_", robot_id], value_type=str),
             "dry_run": ParameterValue(dry_run, value_type=bool),
         }],
         remappings=[
@@ -127,6 +134,10 @@ def generate_launch_description():
             "server_url": groot_server_url,
             "token_file": groot_token_file,
             "task": groot_task,
+            "joint_state_topic": ParameterValue([
+                "/topic_arm_whole_body_and_gripper_current_joints_status_0_",
+                robot_id,
+            ], value_type=str),
             "max_inference_latency_sec": ParameterValue(
                 groot_max_inference_latency_sec, value_type=float),
         }],
@@ -160,6 +171,10 @@ def generate_launch_description():
             default_value="/home/ubuntu/hg_dagger_data",
             description="Explicit writable root for sidecar and LeRobot datasets.",
         ),
+        DeclareLaunchArgument(
+            "robot_id", default_value="328",
+            description="Robot numeric ID used to build vendor topic suffixes.",
+        ),
         DeclareLaunchArgument("task_name", default_value="hg_dagger_task"),
         DeclareLaunchArgument(
             "start_groot_bridge", default_value="false",
@@ -177,6 +192,7 @@ def generate_launch_description():
             description="Fail over to VR when one GR00T start/infer/retry reaches this latency; <=0 disables.",
         ),
         SetEnvironmentVariable("ROS_DOMAIN_ID", ros_domain_id),
+        SetEnvironmentVariable("ROBOT_ID", robot_id),
         SetEnvironmentVariable("ROS_AUTOMATIC_DISCOVERY_RANGE", "SUBNET"),
         SetEnvironmentVariable("RMW_IMPLEMENTATION", rmw_implementation),
         SetEnvironmentVariable("CYCLONEDDS_URI", cyclonedds_uri),

@@ -6,6 +6,8 @@ task_text="${2:-${task_name}}"
 data_root="${3:-${HG_DAGGER_DATA_ROOT:-/home/ubuntu/hg_dagger_data}}"
 collector_root="${HG_DAGGER_COLLECTOR_ROOT:-/home/ubuntu/lerobot_data_collector}"
 lerobot_py="${LEROBOT_PY:-/home/ubuntu/miniconda3/envs/lerobot/bin/python}"
+robot_id="${HG_DAGGER_ROBOT_ID:-${ROBOT_ID:-328}}"
+topic_suffix="${HG_DAGGER_TOPIC_SUFFIX:-0_${robot_id}}"
 
 if [ -z "${task_name}" ]; then
   echo "Usage: $0 TASK_NAME [TASK_TEXT] [DATA_ROOT]" >&2
@@ -13,6 +15,10 @@ if [ -z "${task_name}" ]; then
 fi
 if [[ "${data_root}" != /* ]]; then
   echo "ERROR: DATA_ROOT must be an absolute path: ${data_root}" >&2
+  exit 3
+fi
+if [[ ! "${robot_id}" =~ ^[0-9]+$ ]] || [[ ! "${topic_suffix}" =~ ^0_[0-9]+$ ]]; then
+  echo "ERROR: invalid robot ID/topic suffix: ${robot_id}/${topic_suffix}" >&2
   exit 3
 fi
 mkdir -p "${data_root}"
@@ -71,7 +77,7 @@ start_one() {
     --output-dir "${dataset_root}"
     --repo-id "local/${task_name}_hg_dagger_${variant}"
     --task-name "${task_text}"
-    --motion-lock-file "/tmp/lerobot_robot_0_328.motion.lock"
+    --motion-lock-file "/tmp/lerobot_robot_${topic_suffix}.motion.lock"
     --fps 30
     --image-source shm
     --image-poll-fps 120
@@ -87,7 +93,7 @@ start_one() {
     --action-mode joint
     --with-head
     --with-upper-waist
-    --state-topic /topic_arm_whole_body_and_gripper_current_joints_status_0_328
+    --state-topic "/topic_arm_whole_body_and_gripper_current_joints_status_${topic_suffix}"
     --action-arm-topic /hg_dagger/collector/arm_action
     --action-gripper-topic /hg_dagger/collector/gripper_action
     --control-fifo "${fifo}"
@@ -100,7 +106,7 @@ start_one() {
 
   nohup env \
     ROS_DOMAIN_ID=0 \
-    ROBOT_ID=328 \
+    ROBOT_ID="${robot_id}" \
     RMW_IMPLEMENTATION=rmw_cyclonedds_cpp \
     CYCLONEDDS_URI="${cyclonedds_uri}" \
     LD_LIBRARY_PATH="${lerobot_env_lib}:${ros_ld_library_path}" \
@@ -115,3 +121,4 @@ start_one rgbd 1 4
 echo "RGBD collector is continuously buffering synchronized pre-roll frames in paused mode."
 echo "It creates an episode only after an HG-DAGGER 'start' command."
 echo "Use the same path in launch: data_root:=${data_root} task_name:=${task_name}"
+echo "Robot ID=${robot_id}, topic suffix=${topic_suffix}"
