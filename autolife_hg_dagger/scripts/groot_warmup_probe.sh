@@ -56,7 +56,8 @@ timeout 150s ros2 topic pub -r 5 /hg_dagger/control_state std_msgs/msg/String \
   "{data: '${control_state}'}" >/dev/null 2>&1 &
 publisher_pid=$!
 
-if ! timeout 150s ros2 topic echo --once /hg_dagger/policy_action >"${action_output}"; then
+if ! timeout 150s ros2 topic echo --full-length --once \
+    /hg_dagger/policy_action >"${action_output}"; then
   echo "ERROR: no warmup policy action received" >&2
   tail -n 80 "${bridge_log}" >&2
   exit 5
