@@ -43,7 +43,7 @@
 cd /home/ubuntu/ros2_ws
 colcon build --packages-select autolife_hg_dagger --symlink-install
 source install/setup.bash
-bash src/autolife_hg_dagger/scripts/setup_hg_web_env.sh
+bash src/autolife-hd-dagger/autolife_hg_dagger/scripts/setup_hg_web_env.sh
 ros2 launch autolife_hg_dagger hg_dagger_vr.launch.py \
   dry_run:=true robot_id:=328 task_name:=my_task data_root:=/path/to/hg_data
 ```
@@ -90,7 +90,7 @@ pre-roll。失败触发时 supervisor 立即执行带 ACK 的 `start`，把该�
 另一个终端观察：
 
 ```bash
-source /home/ubuntu/ros2_ws/src/autolife_hg_dagger/scripts/source_hg_ros_env.sh
+source /home/ubuntu/ros2_ws/src/autolife-hd-dagger/autolife_hg_dagger/scripts/source_hg_ros_env.sh
 ros2 topic echo /hg_dagger/control_state
 ros2 service call /hg_dagger/set_session_enabled std_srvs/srv/SetBool "{data: true}"
 ```
@@ -102,7 +102,7 @@ ros2 service call /hg_dagger/set_session_enabled std_srvs/srv/SetBool "{data: tr
 本包不会修改 `CB_Autolife_Data_Collector`。先在另一个终端启动固定 schema 的 RGBD recorder：
 
 ```bash
-bash /home/ubuntu/ros2_ws/src/autolife_hg_dagger/scripts/start_hg_collectors.sh \
+bash /home/ubuntu/ros2_ws/src/autolife-hd-dagger/autolife_hg_dagger/scripts/start_hg_collectors.sh \
   my_task "任务文本" /path/to/hg_data
 ```
 
