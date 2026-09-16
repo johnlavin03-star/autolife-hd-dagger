@@ -36,6 +36,8 @@ const state = {
   headText: null,
   vrNotice: null,
   vrNoticeTimer: null,
+  hgStatusHud: null,
+  hgStatusHudTimer: null,
   desktopWakeLock: null,
   desktopWakeLockPending: false,
   desktopWakeLockRetryAt: 0,
@@ -55,6 +57,7 @@ const state = {
     lastQuickResetActive: null,
     lastHgDaggerMode: null,
     lastHgDaggerHapticToken: null,
+    lastHgDaggerVisualKey: null,
     desktopModeAvailable: false,
     desktopModeRequestPending: false,
     desktopModeLastReady: null,
@@ -122,6 +125,115 @@ function showVrNotice(message, durationMs = 3500, color = '#7DFFCF') {
     if (state.vrNotice === notice) notice.setAttribute('visible', false);
     state.vrNoticeTimer = null;
   }, Math.max(1000, Number(durationMs) || 3500));
+}
+
+const HG_DAGGER_MODE_LABELS = {
+  DISARMED: '未使能',
+  POLICY_ACTIVE: 'VLA 控制',
+  FAILURE_HOLD: '请求接管 · 机器人保持',
+  EXPERT_RELEASE_REQUIRED: '请完全松开双 Grip',
+  EXPERT_READY: '请再次按下 Grip',
+  EXPERT_ACTIVE: 'VR 接管中',
+  POLICY_WARMUP: 'VLA 预热中',
+  ESTOP: '安全停止'
+};
+
+function hgDaggerVisualState(hgDagger) {
+  const mode = String(hgDagger?.mode || 'DISARMED');
+  const paused = mode === 'EXPERT_ACTIVE' && hgDagger?.expert_paused === true;
+  return {
+    key: paused ? `${mode}:paused` : mode,
+    label: paused ? 'VR 已暂停 · 按 Grip 继续' : (HG_DAGGER_MODE_LABELS[mode] || mode),
+    color: mode === 'ESTOP' ? '#FF6B6B'
+      : ['FAILURE_HOLD', 'EXPERT_RELEASE_REQUIRED'].includes(mode) ? '#FFB86B'
+        : ['EXPERT_READY', 'EXPERT_ACTIVE'].includes(mode) ? '#7DFFCF'
+          : mode === 'POLICY_ACTIVE' || mode === 'POLICY_WARMUP' ? '#79C7FF'
+            : '#D7E0EA'
+  };
+}
+
+function drawHgStatusHud(message, color) {
+  const hud = state.hgStatusHud;
+  if (!hud) return;
+  const { canvas, context, texture } = hud;
+  const width = canvas.width;
+  const height = canvas.height;
+  context.clearRect(0, 0, width, height);
+  context.fillStyle = 'rgba(5, 10, 16, 0.76)';
+  context.beginPath();
+  if (typeof context.roundRect === 'function') {
+    context.roundRect(4, 4, width - 8, height - 8, 28);
+  } else {
+    context.rect(4, 4, width - 8, height - 8);
+  }
+  context.fill();
+  context.fillStyle = color;
+  context.fillRect(4, 28, 10, height - 56);
+  context.textAlign = 'center';
+  context.textBaseline = 'middle';
+  context.font = '600 38px sans-serif';
+  context.fillText(String(message), width / 2 + 4, height / 2 + 1, width - 72);
+  texture.needsUpdate = true;
+}
+
+function ensureHgStatusHud() {
+  if (state.hgStatusHud) return state.hgStatusHud;
+  const cameraEl = document.querySelector('a-scene')?.camera?.el;
+  if (!cameraEl?.object3D || typeof THREE === 'undefined') return null;
+
+  const canvas = document.createElement('canvas');
+  canvas.width = 1024;
+  canvas.height = 128;
+  const context = canvas.getContext('2d');
+  if (!context) return null;
+  const texture = new THREE.CanvasTexture(canvas);
+  if ('colorSpace' in texture && THREE.SRGBColorSpace) {
+    texture.colorSpace = THREE.SRGBColorSpace;
+  } else if (THREE.sRGBEncoding) {
+    texture.encoding = THREE.sRGBEncoding;
+  }
+  const material = new THREE.MeshBasicMaterial({
+    map: texture,
+    transparent: true,
+    depthTest: false,
+    depthWrite: false
+  });
+  const mesh = new THREE.Mesh(new THREE.PlaneGeometry(0.76, 0.095), material);
+  mesh.name = 'hg-dagger-status-hud';
+  mesh.position.set(0, 0.34, -0.82);
+  mesh.renderOrder = 10000;
+  mesh.visible = Boolean(state.xrSession);
+  cameraEl.object3D.add(mesh);
+  state.hgStatusHud = { canvas, context, texture, material, mesh };
+  drawHgStatusHud('当前：未使能', '#D7E0EA');
+  return state.hgStatusHud;
+}
+
+function updateHgStatusHud(hgDagger, { forceCurrent = false } = {}) {
+  const hud = ensureHgStatusHud();
+  if (!hud || !hgDagger) return;
+  hud.mesh.visible = Boolean(state.xrSession);
+  const next = hgDaggerVisualState(hgDagger);
+  const previousKey = state.teleop.lastHgDaggerVisualKey;
+  const changed = previousKey !== null && previousKey !== next.key;
+  if ((changed || forceCurrent) && state.hgStatusHudTimer) {
+    window.clearTimeout(state.hgStatusHudTimer);
+    state.hgStatusHudTimer = null;
+  }
+  if (changed && !forceCurrent) {
+    const previous = hgDaggerVisualState({
+      mode: previousKey.split(':')[0],
+      expert_paused: previousKey.endsWith(':paused')
+    });
+    drawHgStatusHud(`${previous.label}  →  ${next.label}`, next.color);
+    state.hgStatusHudTimer = window.setTimeout(() => {
+      drawHgStatusHud(`当前：${next.label}`, next.color);
+      state.hgStatusHudTimer = null;
+    }, 2200);
+  } else if (forceCurrent || previousKey !== next.key) {
+    drawHgStatusHud(`当前：${next.label}`, next.color);
+  }
+  state.teleop.lastHgDaggerVisualKey = next.key;
 }
 
 function pulseVrControllers(intensity = 0.7, durationMs = 180) {
@@ -409,6 +521,7 @@ async function refreshHardwareStatus() {
     const hgDagger = state.teleop.status?.hg_dagger;
     const hgMode = String(hgDagger?.mode || '');
     const hapticToken = hgDagger?.haptic_token;
+    updateHgStatusHud(hgDagger);
     if (
       hgMode
       && (
@@ -2148,6 +2261,8 @@ AFRAME.registerComponent('telegrip-vr-bridge', {
       this.resetDesktopModeChord();
       state.xrSession = this.el.renderer.xr.getSession();
       ensureVrNotice();
+      ensureHgStatusHud();
+      updateHgStatusHud(state.teleop.status?.hg_dagger, { forceCurrent: true });
       setCameraMode('passthrough');
       setStatus('VR 已进入，正在检测手柄实时姿态。');
       attachRigToCamera();
@@ -2162,6 +2277,7 @@ AFRAME.registerComponent('telegrip-vr-bridge', {
       this.releaseAllControllerButtons();
       this.resetDesktopModeChord();
       state.xrSession = null;
+      if (state.hgStatusHud) state.hgStatusHud.mesh.visible = false;
       if (desktopModeEnabledFromStatus()) {
         setStatus(
           '头显已退出沉浸模式；机器人保持当前位置。重新进入 VR 后可继续接管。'
