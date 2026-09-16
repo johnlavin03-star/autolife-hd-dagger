@@ -42,6 +42,7 @@ def generate_launch_description():
     groot_task = LaunchConfiguration("groot_task")
     groot_max_inference_latency_sec = LaunchConfiguration(
         "groot_max_inference_latency_sec")
+    policy_timeout_sec = LaunchConfiguration("policy_timeout_sec")
 
     supervisor = Node(
         package="autolife_hg_dagger",
@@ -60,6 +61,8 @@ def generate_launch_description():
             "vendor_gripper_command_topic": ParameterValue([
                 "/topic_arm_gripper_target_joints_position_0_", robot_id
             ], value_type=str),
+            "policy_timeout_sec": ParameterValue(
+                policy_timeout_sec, value_type=float),
         }],
     )
 
@@ -99,6 +102,9 @@ def generate_launch_description():
         parameters=[teleop_config, {
             "topic_suffix": ParameterValue(["0_", robot_id], value_type=str),
             "dry_run": ParameterValue(dry_run, value_type=bool),
+            # X+A quick reset calls the controller directly in the stock mapper.
+            # Disable it so every motion request remains behind the HG authority.
+            "quick_reset_enabled": False,
         }],
         remappings=[
             (f"{VR_PREFIX}/eef_target", f"{HG_PREFIX}/expert/eef_target"),
@@ -190,6 +196,10 @@ def generate_launch_description():
         DeclareLaunchArgument(
             "groot_max_inference_latency_sec", default_value="1.0",
             description="Fail over to VR when one GR00T start/infer/retry reaches this latency; <=0 disables.",
+        ),
+        DeclareLaunchArgument(
+            "policy_timeout_sec", default_value="0.25",
+            description="Supervisor policy heartbeat timeout; use a larger value for VR-only commissioning.",
         ),
         SetEnvironmentVariable("ROS_DOMAIN_ID", ros_domain_id),
         SetEnvironmentVariable("ROBOT_ID", robot_id),

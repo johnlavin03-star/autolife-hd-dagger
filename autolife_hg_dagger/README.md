@@ -9,6 +9,7 @@
 - 接管前向 controller 发双臂 `release_hold`，等待 controller 报告 `HOLDING` 后才允许 VR 目标通过。
 - controller 确认保持后必须先松开双 Grip，再次按 Grip 才能从最新实测 FK 重新锚定；网页会提示并尝试触发手柄震动。
 - 硬件使能由 `/hg_dagger/set_session_enabled` 代理，controller 启动参数强制 `quick_reset_after_hardware_enable=false`，因此使能/接管不触发复位。
+- mapper 的 X+A quick reset 在 HG launch 中强制关闭，防止动作绕过 supervisor 的单点仲裁。
 - 机器人侧 wall clock 与 monotonic clock 时间戳；浏览器时间戳仅保留为诊断字段。
 - Grip 请求接管；双 Grip 松开时长按 Y 返回 policy warmup。当前固定为 RGBD，Y 短按切换已锁定。
 - 初版 policy 恢复预热：连续 6 个动作、至少 0.2 秒，并检查与当前 applied action 的跳变。
@@ -96,6 +97,24 @@ ros2 service call /hg_dagger/set_session_enabled std_srvs/srv/SetBool "{data: tr
 ```
 
 完成 dry-run、topic 单发布者检查和低速人工监督测试之前，不要以 `dry_run:=false` 启动。
+
+## 实机启动前检查
+
+实机上优先使用 fail-closed wrapper。它会检查底层手臂服务与实时关节反馈、四路
+RGBD/手部相机 SHM、8446 端口，以及是否存在桌面 VR 导航程序启动的旧 controller。
+任一项失败都不会启动 HD-DAGGER：
+
+```bash
+export HG_DAGGER_ROBOT_ID=300
+export HG_DAGGER_START_GROOT=false
+bash /home/ubuntu/ros2_ws/src/autolife-hd-dagger/autolife_hg_dagger/scripts/launch_hg_dagger.sh \
+  dry_run:=true task_name:=hd300_check data_root:=/home/ubuntu/hg_dagger_data_300 \
+  policy_timeout_sec:=30.0
+```
+
+启用 THOR 前设置 `HG_DAGGER_START_GROOT=true`；wrapper 会额外检查 token 权限和
+THOR `/health`。`policy_timeout_sec:=30.0` 只用于纯 VR 调试，正式 VLA 联调恢复为
+默认 `0.25` 秒。不要同时运行桌面端 `full_vr_navigation.launch.py` 与本 launch。
 
 ## Collector 对接边界
 
