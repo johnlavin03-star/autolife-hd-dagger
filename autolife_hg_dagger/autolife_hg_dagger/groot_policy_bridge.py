@@ -126,7 +126,11 @@ class GrootPolicyBridge(Node):
         self._load_camera_reader()
         self._worker = threading.Thread(target=self._run, name="groot-policy-worker", daemon=True)
         self._worker.start()
-        self.get_logger().info("GR00T bridge ready behind HG-DAgger authority")
+        self.get_logger().info(
+            "GR00T bridge ready and IDLE behind HG-DAgger authority; "
+            "inference starts only after control_state enters POLICY_ACTIVE "
+            "or POLICY_WARMUP"
+        )
 
     def _load_camera_reader(self) -> None:
         root = Path(str(self.get_parameter("collector_root").value))

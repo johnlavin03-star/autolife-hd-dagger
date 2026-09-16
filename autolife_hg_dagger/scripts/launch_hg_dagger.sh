@@ -14,5 +14,11 @@ fi
 
 bash "${script_dir}/preflight_hg_robot.sh" "${preflight_args[@]}"
 
+if [ "$start_groot" = "true" ]; then
+  echo "INFO  GR00T bridge will start IDLE behind HG-DAGGER authority."
+  echo "INFO  Inference begins only after the operator enables the session in VR"
+  echo "INFO  or calls /hg_dagger/set_session_enabled with data=true."
+fi
+
 exec ros2 launch autolife_hg_dagger hg_dagger_vr.launch.py \
   robot_id:="$robot_id" start_groot_bridge:="$start_groot" "$@"
