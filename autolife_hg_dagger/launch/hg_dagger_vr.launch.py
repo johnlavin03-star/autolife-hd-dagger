@@ -91,6 +91,7 @@ def generate_launch_description():
         }],
         remappings=[
             (f"{VR_PREFIX}/set_hardware_enabled", f"{HG_PREFIX}/controller/set_hardware_enabled"),
+            (f"{VR_PREFIX}/quick_reset", f"{HG_PREFIX}/controller/quick_reset"),
         ],
     )
 

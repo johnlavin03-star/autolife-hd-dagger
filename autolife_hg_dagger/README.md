@@ -6,6 +6,8 @@
 
 - VLA joint action 与 VR expert action 的单点控制权仲裁。
 - `POLICY_ACTIVE → FAILURE_HOLD → EXPERT_RELEASE_REQUIRED → EXPERT_READY → EXPERT_ACTIVE → POLICY_WARMUP` 状态机。
+- 长按 Y 交还后，VLA warmup 与 RGBD 视频编码并行；warmup 连续输出稳定后恢复策略，采集器在后台完成 manifest ACK，避免长片段编码阻塞控制状态。
+- 在 `EXPERT_RELEASE_REQUIRED`、`EXPERT_READY`，或双 Grip 已松开的 `EXPERT_ACTIVE` 中，长按左 X + 右 A 1 秒可请求原控制器的碰撞检查快速复位。复位全程仍经过 HG-DAgger 仲裁，完成后必须重新按 Grip 锚定；含复位运动的 intervention 会被标记为不可训练并丢弃。
 - 接管前向 controller 发双臂 `release_hold`，等待 controller 报告 `HOLDING` 后才允许 VR 目标通过。
 - controller 确认保持后必须先松开双 Grip，再次按 Grip 才能从最新实测 FK 重新锚定；网页会提示并尝试触发手柄震动。
 - 硬件使能由 `/hg_dagger/set_session_enabled` 代理，controller 启动参数强制 `quick_reset_after_hardware_enable=false`，因此使能/接管不触发复位。

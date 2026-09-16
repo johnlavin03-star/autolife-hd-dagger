@@ -140,11 +140,15 @@ const HG_DAGGER_MODE_LABELS = {
 
 function hgDaggerVisualState(hgDagger) {
   const mode = String(hgDagger?.mode || 'DISARMED');
+  const resetActive = hgDagger?.quick_reset?.pending === true
+    || hgDagger?.quick_reset?.active === true;
   const paused = mode === 'EXPERT_ACTIVE' && hgDagger?.expert_paused === true;
   return {
-    key: paused ? `${mode}:paused` : mode,
-    label: paused ? 'VR 已暂停 · 按 Grip 继续' : (HG_DAGGER_MODE_LABELS[mode] || mode),
+    key: resetActive ? 'HG_RESET_ACTIVE' : (paused ? `${mode}:paused` : mode),
+    label: resetActive ? '机器人复位中 · 请松开 X+A'
+      : (paused ? 'VR 已暂停 · 按 Grip 继续' : (HG_DAGGER_MODE_LABELS[mode] || mode)),
     color: mode === 'ESTOP' ? '#FF6B6B'
+      : resetActive ? '#FFD166'
       : ['FAILURE_HOLD', 'EXPERT_RELEASE_REQUIRED'].includes(mode) ? '#FFB86B'
         : ['EXPERT_READY', 'EXPERT_ACTIVE'].includes(mode) ? '#7DFFCF'
           : mode === 'POLICY_ACTIVE' || mode === 'POLICY_WARMUP' ? '#79C7FF'

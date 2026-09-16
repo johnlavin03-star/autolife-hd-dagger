@@ -9,6 +9,7 @@ from autolife_hg_dagger.core import (
     grip_snapshot,
     left_y_snapshot,
     policy_to_controller,
+    xa_snapshot,
 )
 
 
@@ -67,11 +68,30 @@ def test_invalid_policy_action(action):
 def test_vr_gestures_from_existing_web_payload():
     packet = {
         "leftController": {"gripActive": True, "yButton": 1},
-        "rightController": {"gripActive": False},
+        "rightController": {"gripActive": False, "aButton": 1},
     }
     assert grip_snapshot(packet) == (True, False)
     assert left_y_snapshot(packet)
     assert not both_grips_released(packet)
+    assert not xa_snapshot(packet)
+
+
+def test_xa_reset_gesture_requires_both_buttons():
+    packet = {
+        "leftController": {"xButton": 1},
+        "rightController": {"aButton": 1},
+    }
+    assert xa_snapshot(packet)
+
+
+def test_reset_returns_expert_pause_to_reanchor_gate():
+    machine = AuthorityStateMachine()
+    machine.enable()
+    machine.failure()
+    machine.hold_confirmed()
+    machine.expert_release_confirmed()
+    machine.expert_first_command()
+    assert machine.reset_to_expert_ready().new == Mode.EXPERT_READY
 
 
 def test_explicit_controller_holding_state_confirms_barrier():

@@ -66,9 +66,9 @@ class TraceWriter:
         frame_count: int,
         reason: str,
         collector_result: Optional[Dict[str, Any]] = None,
-    ) -> None:
+    ) -> Optional[Path]:
         if self._directory is None:
-            return
+            return None
         manifest_path = self._directory / "manifest.json"
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         manifest.update({
@@ -84,6 +84,17 @@ class TraceWriter:
             handle.close()
         self._files.clear()
         self._directory = None
+        return manifest_path
+
+    @staticmethod
+    def update_finished_manifest(
+        manifest_path: Path, status: str, collector_result: Dict[str, Any]
+    ) -> None:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["status"] = str(status)
+        manifest["collector_result"] = dict(collector_result)
+        manifest["collector_finished_wall_ns"] = time.time_ns()
+        TraceWriter._write_json(manifest_path, manifest)
 
     @staticmethod
     def _write_json(path: Path, data: Dict[str, Any]) -> None:
@@ -149,6 +160,11 @@ class CollectorFifo:
                 False, False, command, request_id,
                 "collector FIFO is unavailable or has no reader",
             )
+        return self.wait_for_result(depth, command, request_id, timeout)
+
+    def wait_for_result(
+        self, depth: bool, command: str, request_id: str, timeout: float = 3.0
+    ) -> CollectorCommandResult:
         status_path = Path(self.paths[bool(depth)]).parent / ".official_recording_status.json"
         deadline = time.monotonic() + max(0.1, float(timeout))
         while time.monotonic() < deadline:

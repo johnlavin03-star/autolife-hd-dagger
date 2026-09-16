@@ -29,6 +29,7 @@ from .core import (
     left_y_snapshot,
     policy_to_controller,
     stamped_envelope,
+    xa_snapshot,
 )
 from .recorder import CollectorFifo, TraceWriter
 
@@ -63,6 +64,8 @@ class HgDaggerSupervisor(Node):
         self._y_press_ns = 0
         self._grips = (False, False)
         self._expert_command_count = 0
+        self._intervention_reset_used = False
+        self._intervention_failure_context_valid = True
         self._recorder_active = False
         self._release_gate_started_ns = 0
         self._expert_command_pending = False
@@ -70,7 +73,16 @@ class HgDaggerSupervisor(Node):
         self._policy_warmup_started_ns = 0
         self._policy_warmup_count = 0
         self._policy_warmup_last_action: Optional[list[float]] = None
+        self._policy_warmup_reference_jump_deg = 0.0
+        self._policy_warmup_rejection = ""
         self._last_failure_reason = ""
+        self._collector_finalize_pending = False
+        self._reset_chord_started_ns = 0
+        self._reset_chord_consumed = False
+        self._dagger_reset_pending = False
+        self._dagger_reset_active = False
+        self._dagger_reset_seen_active = False
+        self._dagger_reset_started_ns = 0
 
         latest = QoSProfile(
             history=QoSHistoryPolicy.KEEP_LAST,
@@ -144,6 +156,11 @@ class HgDaggerSupervisor(Node):
             "/hg_dagger/controller/set_hardware_enabled",
             callback_group=service_group,
         )
+        self._controller_quick_reset = self.create_client(
+            Trigger,
+            "/hg_dagger/controller/quick_reset",
+            callback_group=service_group,
+        )
         self.create_service(
             SetBool,
             "/hg_dagger/set_session_enabled",
@@ -173,12 +190,15 @@ class HgDaggerSupervisor(Node):
             "default_depth_enabled": True,
             "rgbd_only": True,
             "y_long_press_seconds": 1.2,
+            "xa_reset_hold_seconds": 1.0,
+            "xa_reset_timeout_sec": 25.0,
             "hold_confirmation_timeout_sec": 1.0,
             "policy_timeout_sec": 0.25,
             "policy_status_timeout_sec": 1.0,
             "expert_timeout_sec": 0.35,
             "policy_warmup_min_actions": 6,
             "policy_warmup_min_duration_sec": 0.20,
+            "policy_warmup_timeout_sec": 12.0,
             "policy_resume_max_arm_jump_deg": 8.0,
             "policy_resume_max_gripper_jump_deg": 80.0,
             "minimum_episode_frames": 15,
@@ -191,6 +211,7 @@ class HgDaggerSupervisor(Node):
             "collector_save_command": "save",
             "collector_discard_command": "discard",
             "collector_command_timeout_sec": 4.0,
+            "collector_finalize_timeout_sec": 120.0,
             "vendor_joint_command_topic": "/topic_arm_whole_body_target_joints_position_0_328",
             "vendor_gripper_command_topic": "/topic_arm_gripper_target_joints_position_0_328",
         }
@@ -263,6 +284,12 @@ class HgDaggerSupervisor(Node):
         self._expert_command_pending = False
         self._publish_release_hold(reason)
         self._event("transition", transition.reason, old=transition.old.value, new=transition.new.value)
+        if self._collector_finalize_pending:
+            self._event(
+                "takeover_recording_deferred",
+                "robot is holding while the previous RGBD episode finishes",
+            )
+            return
         # Freeze the rolling pre-failure window at the failure boundary. Waiting
         # until the operator completes release/re-grip would let that window roll
         # forward and could evict the actual failure context.
@@ -279,6 +306,93 @@ class HgDaggerSupervisor(Node):
                 old=transition.old.value,
                 new=transition.new.value,
             )
+
+    def _update_reset_gesture_locked(self, chord: bool, now_ns: int) -> None:
+        if not chord:
+            self._reset_chord_started_ns = 0
+            self._reset_chord_consumed = False
+            return
+        if (
+            self._reset_chord_consumed
+            or self._dagger_reset_pending
+            or self._dagger_reset_active
+        ):
+            return
+        allowed = (
+            not any(self._grips)
+            and self._machine.mode in (
+                Mode.EXPERT_RELEASE_REQUIRED,
+                Mode.EXPERT_READY,
+                Mode.EXPERT_ACTIVE,
+            )
+        )
+        if not allowed:
+            self._reset_chord_started_ns = 0
+            return
+        if not self._reset_chord_started_ns:
+            self._reset_chord_started_ns = now_ns
+            return
+        duration = (now_ns - self._reset_chord_started_ns) / 1e9
+        if duration < float(self.get_parameter("xa_reset_hold_seconds").value):
+            return
+        self._reset_chord_consumed = True
+        self._reset_chord_started_ns = 0
+        self._request_quick_reset_locked()
+
+    def _request_quick_reset_locked(self) -> None:
+        if not self._controller_quick_reset.service_is_ready():
+            self._event(
+                "quick_reset_rejected", "controller quick-reset service is unavailable"
+            )
+            return
+        self._publish_release_hold("X+A quick reset authority barrier")
+        if self._intervention_id:
+            self._intervention_reset_used = True
+            self._event(
+                "intervention_invalidated",
+                "quick reset occurred inside intervention; episode will be discarded",
+            )
+        self._dagger_reset_pending = True
+        future = self._controller_quick_reset.call_async(Trigger.Request())
+
+        def finished(done: Any) -> None:
+            with self._lock:
+                self._dagger_reset_pending = False
+                try:
+                    response = done.result()
+                except Exception as exc:
+                    self._event("quick_reset_rejected", f"quick reset call failed: {exc}")
+                    return
+                if not bool(response.success):
+                    self._event("quick_reset_rejected", str(response.message))
+                    return
+                self._dagger_reset_active = True
+                self._dagger_reset_seen_active = bool(
+                    self._controller_status.get("quick_reset_active", False)
+                )
+                self._dagger_reset_started_ns = time.monotonic_ns()
+                self._expert_command_pending = False
+                self._last_expert_monotonic_ns = 0
+                self._event("quick_reset_started", str(response.message))
+
+        future.add_done_callback(finished)
+
+    def _complete_quick_reset_locked(self) -> None:
+        self._dagger_reset_active = False
+        self._dagger_reset_seen_active = False
+        self._dagger_reset_started_ns = 0
+        self._expert_command_pending = False
+        self._last_expert_monotonic_ns = 0
+        try:
+            transition = self._machine.reset_to_expert_ready()
+        except ValueError as exc:
+            self._event("quick_reset_completed", str(exc))
+            return
+        self._publish_release_hold("quick reset completed; Grip re-anchor required")
+        self._event(
+            "transition", transition.reason,
+            old=transition.old.value, new=transition.new.value,
+        )
 
     def _on_vr_input(self, message: String) -> None:
         try:
@@ -332,6 +446,10 @@ class HgDaggerSupervisor(Node):
                     "Grip pressed after expert pause; waiting for fresh target",
                 )
 
+            self._update_reset_gesture_locked(
+                xa_snapshot(packet), envelope["robot_receive_monotonic_ns"]
+            )
+
             event_type = packet.get("type")
             if str(packet.get("hand", "")).lower() == "left" and str(packet.get("button", "")).upper() == "Y" and event_type in ("button_press", "button_release"):
                 now_y = bool(packet.get("pressed", event_type == "button_press"))
@@ -381,6 +499,7 @@ class HgDaggerSupervisor(Node):
                 reference = self._latest_action
                 if reference is None:
                     self._policy_warmup_count = 0
+                    self._policy_warmup_rejection = "waiting for controller reference"
                     return
                 arm_jump = max(
                     abs(candidate - current)
@@ -390,15 +509,9 @@ class HgDaggerSupervisor(Node):
                     abs(candidate - current)
                     for candidate, current in zip(action[14:16], reference[14:16])
                 )
-                if (
-                    arm_jump > float(self.get_parameter(
-                        "policy_resume_max_arm_jump_deg").value)
-                    or gripper_jump > float(self.get_parameter(
-                        "policy_resume_max_gripper_jump_deg").value)
-                ):
-                    self._policy_warmup_count = 0
-                    self._policy_warmup_last_action = action
-                    return
+                self._policy_warmup_reference_jump_deg = max(
+                    arm_jump, gripper_jump
+                )
                 if self._policy_warmup_last_action is not None:
                     consecutive_jump = max(
                         abs(candidate - previous)
@@ -410,9 +523,13 @@ class HgDaggerSupervisor(Node):
                             "policy_resume_max_arm_jump_deg").value):
                         self._policy_warmup_count = 0
                         self._policy_warmup_last_action = action
+                        self._policy_warmup_rejection = (
+                            f"unstable policy stream: {consecutive_jump:.2f} deg step"
+                        )
                         return
                 self._policy_warmup_last_action = action
                 self._policy_warmup_count += 1
+                self._policy_warmup_rejection = ""
                 elapsed = (
                     time.monotonic_ns() - self._policy_warmup_started_ns
                 ) / 1e9
@@ -485,7 +602,12 @@ class HgDaggerSupervisor(Node):
                 f"pos_{side}_in_robot" in payload or f"quat_{side}_in_robot" in payload
                 for side in ("left", "right")
             )
-            if self._machine.mode not in (Mode.EXPERT_READY, Mode.EXPERT_ACTIVE) or not has_pose:
+            if (
+                self._dagger_reset_pending
+                or self._dagger_reset_active
+                or self._machine.mode not in (Mode.EXPERT_READY, Mode.EXPERT_ACTIVE)
+                or not has_pose
+            ):
                 return
             if self._machine.mode == Mode.EXPERT_READY:
                 if not any(self._grips):
@@ -518,7 +640,11 @@ class HgDaggerSupervisor(Node):
             self._event("expert_gripper_rejected", str(exc))
             return
         with self._lock:
-            if self._machine.mode != Mode.EXPERT_ACTIVE:
+            if (
+                self._dagger_reset_pending
+                or self._dagger_reset_active
+                or self._machine.mode != Mode.EXPERT_ACTIVE
+            ):
                 return
             self._selected_gripper_pub.publish(message)
             for index, side in enumerate(("left", "right")):
@@ -541,6 +667,12 @@ class HgDaggerSupervisor(Node):
             return
         with self._lock:
             self._controller_status = status
+            if self._dagger_reset_active:
+                backend_active = bool(status.get("quick_reset_active", False))
+                if backend_active:
+                    self._dagger_reset_seen_active = True
+                elif self._dagger_reset_seen_active:
+                    self._complete_quick_reset_locked()
             if bool(status.get("emergency_stop_latched")) or status.get("state") == "FAULT":
                 if self._machine.mode != Mode.ESTOP:
                     transition = self._machine.estop(str(status.get("reason", "controller fault")))
@@ -549,6 +681,7 @@ class HgDaggerSupervisor(Node):
                 return
             if (
                 self._machine.mode == Mode.FAILURE_HOLD
+                and self._recorder_active
                 and controller_hold_confirmed(status)
             ):
                 transition = self._machine.hold_confirmed()
@@ -616,10 +749,18 @@ class HgDaggerSupervisor(Node):
                 self._last_vendor_command_monotonic_ns = time.monotonic_ns()
                 self._last_vendor_command_wall_ns = time.time_ns()
 
-    def _start_intervention_locked(self) -> None:
+    def _start_intervention_locked(
+        self, *, failure_context_valid: bool = True
+    ) -> None:
+        if self._collector_finalize_pending:
+            raise RuntimeError(
+                "previous RGBD episode is still being finalized"
+            )
         self._intervention_id = f"int-{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
         self._active_depth = self._depth_next
         self._expert_command_count = 0
+        self._intervention_reset_used = False
+        self._intervention_failure_context_valid = bool(failure_context_valid)
         self._trace.start(
             self._session_id,
             self._intervention_id,
@@ -631,6 +772,7 @@ class HgDaggerSupervisor(Node):
                     "neck_roll_pitch_yaw", "waist_pitch_yaw",
                 ],
                 "collector_fifo": self._collector.paths[self._active_depth],
+                "failure_context_valid": self._intervention_failure_context_valid,
             },
         )
         command = str(self.get_parameter("collector_start_command").value)
@@ -663,10 +805,55 @@ class HgDaggerSupervisor(Node):
         if not self._intervention_id:
             return
         minimum = int(self.get_parameter("minimum_episode_frames").value)
-        save = requested_save and self._expert_command_count >= minimum
+        save = (
+            requested_save
+            and self._expert_command_count >= minimum
+            and not self._intervention_reset_used
+            and self._intervention_failure_context_valid
+        )
         command_name = "collector_save_command" if save else "collector_discard_command"
         result = None
-        if self._recorder_active:
+        if save and self._recorder_active:
+            request_id = uuid.uuid4().hex
+            command = str(self.get_parameter(command_name).value)
+            if self._collector.command(self._active_depth, command, request_id):
+                pending_result = {
+                    "acknowledged": False,
+                    "success": False,
+                    "event": command,
+                    "request_id": request_id,
+                    "message": "collector save is finalizing in background",
+                    "episode_index": None,
+                    "frames": 0,
+                }
+                manifest_path = self._trace.finish(
+                    "collector_save_pending",
+                    self._expert_command_count,
+                    reason,
+                    pending_result,
+                )
+                self._collector_finalize_pending = True
+                self._intervention_id = ""
+                self._recorder_active = False
+                threading.Thread(
+                    target=self._finalize_collector_save,
+                    args=(
+                        self._active_depth, command, request_id, manifest_path,
+                        self._expert_command_count, reason,
+                    ),
+                    name="hg-dagger-collector-finalize",
+                    daemon=True,
+                ).start()
+                self._event(
+                    "intervention_finalize_started",
+                    "policy recovery may continue while RGBD encoding finishes",
+                    collector_request_id=request_id,
+                )
+                return
+            result = self._collector.wait_for_result(
+                self._active_depth, command, request_id, 0.1
+            )
+        elif self._recorder_active:
             result = self._collector.command_and_wait(
                 self._active_depth,
                 str(self.get_parameter(command_name).value),
@@ -703,6 +890,73 @@ class HgDaggerSupervisor(Node):
         self._intervention_id = ""
         self._recorder_active = False
 
+    def _finalize_collector_save(
+        self, depth: bool, command: str, request_id: str, manifest_path: Any,
+        frame_count: int, reason: str,
+    ) -> None:
+        result = self._collector.wait_for_result(
+            depth,
+            command,
+            request_id,
+            float(self.get_parameter("collector_finalize_timeout_sec").value),
+        )
+        collector_ok = result.acknowledged and result.success
+        if collector_ok and result.event == "save":
+            status = "saved"
+        elif collector_ok and result.event == "discard":
+            status = "discarded_invalid"
+        else:
+            status = "collector_command_failed"
+        if manifest_path is not None:
+            try:
+                TraceWriter.update_finished_manifest(
+                    manifest_path, status, result.as_dict()
+                )
+            except Exception as exc:
+                self.get_logger().error(
+                    f"failed to update finalized intervention manifest: {exc}"
+                )
+        with self._lock:
+            self._collector_finalize_pending = False
+            self._event(
+                "intervention_finished",
+                reason,
+                status=status,
+                frame_count=frame_count,
+                collector_acknowledged=result.acknowledged,
+                collector_success=collector_ok,
+                collector_episode_index=result.episode_index,
+                collector_request_id=request_id,
+            )
+            if (
+                self._machine.mode == Mode.FAILURE_HOLD
+                and not self._intervention_id
+            ):
+                try:
+                    self._start_intervention_locked(failure_context_valid=False)
+                    self._event(
+                        "intervention_invalidated",
+                        "takeover occurred while the prior episode was encoding; "
+                        "the original pre-failure camera window is unavailable",
+                    )
+                except Exception as exc:
+                    transition = self._machine.estop(
+                        f"deferred trace/collector start failed: {exc}"
+                    )
+                    self._publish_release_hold("recording setup failed")
+                    self._event(
+                        "recording_setup_failed", str(exc),
+                        old=transition.old.value, new=transition.new.value,
+                    )
+                    return
+                if controller_hold_confirmed(self._controller_status):
+                    transition = self._machine.hold_confirmed()
+                    self._release_gate_started_ns = time.monotonic_ns()
+                    self._event(
+                        "transition", transition.reason,
+                        old=transition.old.value, new=transition.new.value,
+                    )
+
     def _resume_locked(self, reason: str) -> None:
         transition = self._machine.resume()
         self._finish_intervention_locked(True, reason)
@@ -710,12 +964,40 @@ class HgDaggerSupervisor(Node):
         self._policy_warmup_started_ns = time.monotonic_ns()
         self._policy_warmup_count = 0
         self._policy_warmup_last_action = None
+        self._policy_warmup_reference_jump_deg = 0.0
+        self._policy_warmup_rejection = ""
         self._last_policy_monotonic_ns = self._policy_warmup_started_ns
         self._event("transition", transition.reason, old=transition.old.value, new=transition.new.value)
 
     def _control_tick(self) -> None:
         with self._lock:
             now_ns = time.monotonic_ns()
+            if self._dagger_reset_active and self._dagger_reset_started_ns:
+                timeout = float(self.get_parameter("xa_reset_timeout_sec").value)
+                if (now_ns - self._dagger_reset_started_ns) / 1e9 > timeout:
+                    self._dagger_reset_active = False
+                    self._publish_release_hold("quick reset timed out")
+                    transition = self._machine.estop("quick reset timed out")
+                    self._event(
+                        "transition", transition.reason,
+                        old=transition.old.value, new=transition.new.value,
+                    )
+                    return
+            if self._machine.mode == Mode.POLICY_WARMUP:
+                warmup_timeout = float(self.get_parameter(
+                    "policy_warmup_timeout_sec").value)
+                if (
+                    self._policy_warmup_started_ns
+                    and (now_ns - self._policy_warmup_started_ns) / 1e9
+                    > warmup_timeout
+                ):
+                    detail = self._policy_warmup_rejection or (
+                        "no stable policy action stream"
+                    )
+                    self._begin_failure_hold(
+                        f"policy warmup timed out: {detail}"
+                    )
+                    return
             if self._machine.mode == Mode.FAILURE_HOLD:
                 timeout = float(self.get_parameter("hold_confirmation_timeout_sec").value)
                 if self._hold_sent_monotonic_ns and (now_ns - self._hold_sent_monotonic_ns) / 1e9 > timeout:
@@ -833,6 +1115,16 @@ class HgDaggerSupervisor(Node):
                         "policy_warmup_min_actions").value),
                     "minimum_duration_sec": float(self.get_parameter(
                         "policy_warmup_min_duration_sec").value),
+                    "reference_jump_deg": round(
+                        self._policy_warmup_reference_jump_deg, 3
+                    ),
+                    "rejection": self._policy_warmup_rejection,
+                },
+                "collector_finalize_pending": self._collector_finalize_pending,
+                "quick_reset": {
+                    "pending": self._dagger_reset_pending,
+                    "active": self._dagger_reset_active,
+                    "seen_controller_active": self._dagger_reset_seen_active,
                 },
                 "policy_bridge": dict(self._policy_status),
                 "failure_reason": self._last_failure_reason,
@@ -841,8 +1133,13 @@ class HgDaggerSupervisor(Node):
             prompts = {
                 Mode.POLICY_ACTIVE: "VLA 正在控制；按 Grip 请求人工接管",
                 Mode.FAILURE_HOLD: (
-                    "失败已触发：" + (self._last_failure_reason or "VLA/操作者请求")
-                    + "；正在停止 VLA 并等待机器人保持"
+                    "上一段数据保存中；机器人保持，保存完成后继续接管"
+                    if self._collector_finalize_pending
+                    else (
+                        "失败已触发："
+                        + (self._last_failure_reason or "VLA/操作者请求")
+                        + "；正在停止 VLA 并等待机器人保持"
+                    )
                 ),
                 Mode.EXPERT_RELEASE_REQUIRED: "机器人已保持：请松开左右 Grip",
                 Mode.EXPERT_READY: "已确认松开：请重新按 Grip，从当前位置接管",
@@ -858,7 +1155,11 @@ class HgDaggerSupervisor(Node):
             web_status = dict(self._mapper_status)
             web_status["hg_dagger"] = {
                 **state,
-                "prompt": prompts[self._machine.mode],
+                "prompt": (
+                    "机器人复位中；请保持双 Grip 松开"
+                    if self._dagger_reset_pending or self._dagger_reset_active
+                    else prompts[self._machine.mode]
+                ),
                 "haptic_token": self._machine.authority_epoch,
             }
             self._web_status_pub.publish(String(data=compact(web_status)))
@@ -881,6 +1182,12 @@ class HgDaggerSupervisor(Node):
     def _on_set_session_enabled(self, request: SetBool.Request, response: SetBool.Response) -> SetBool.Response:
         if request.data:
             with self._lock:
+                if self._collector_finalize_pending:
+                    response.success = False
+                    response.message = (
+                        "previous RGBD episode is still being finalized"
+                    )
+                    return response
                 if self._machine.mode != Mode.DISARMED:
                     response.success = False
                     response.message = (

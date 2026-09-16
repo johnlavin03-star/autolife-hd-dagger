@@ -20,6 +20,24 @@ def test_trace_manifest_and_ring(tmp_path):
     assert (directory / "pre_failure_trace.jsonl").exists()
 
 
+def test_pending_manifest_can_be_finalized_after_trace_closes(tmp_path):
+    writer = TraceWriter(str(tmp_path), ring_seconds=5.0)
+    directory = writer.start("session-a", "int-b", True, {"schema": "base21"})
+    manifest_path = writer.finish(
+        "collector_save_pending", 30, "operator resume",
+        {"request_id": "request-a", "success": False},
+    )
+    assert manifest_path == directory / "manifest.json"
+    TraceWriter.update_finished_manifest(
+        manifest_path,
+        "saved",
+        {"request_id": "request-a", "success": True, "event": "save"},
+    )
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest["status"] == "saved"
+    assert manifest["collector_result"]["success"] is True
+
+
 def test_fifo_missing_is_safe(tmp_path):
     fifo = CollectorFifo(str(tmp_path / "rgb"), str(tmp_path / "rgbd"))
     assert not fifo.command(False, "start")

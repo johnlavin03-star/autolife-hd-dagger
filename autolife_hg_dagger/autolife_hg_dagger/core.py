@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 import math
-from typing import Any, Dict, Iterable, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 
 class Mode(str, Enum):
@@ -98,6 +98,18 @@ class AuthorityStateMachine:
             raise ValueError(f"warmup completion is invalid in {self.mode.value}")
         return self._move(Mode.POLICY_ACTIVE, "fresh policy action accepted")
 
+    def reset_to_expert_ready(self) -> Transition:
+        if self.mode not in (
+            Mode.EXPERT_RELEASE_REQUIRED,
+            Mode.EXPERT_READY,
+            Mode.EXPERT_ACTIVE,
+        ):
+            raise ValueError(f"expert reset is invalid in {self.mode.value}")
+        return self._move(
+            Mode.EXPERT_READY,
+            "quick reset completed; press Grip to re-anchor",
+        )
+
     def estop(self, reason: str) -> Transition:
         return self._move(Mode.ESTOP, reason)
 
@@ -159,6 +171,17 @@ def grip_snapshot(packet: Dict[str, Any]) -> Tuple[bool, bool]:
 def left_y_snapshot(packet: Dict[str, Any]) -> bool:
     controller = packet.get("leftController")
     return bool(controller.get("yButton", False)) if isinstance(controller, dict) else False
+
+
+def xa_snapshot(packet: Dict[str, Any]) -> bool:
+    left = packet.get("leftController")
+    right = packet.get("rightController")
+    return bool(
+        isinstance(left, dict)
+        and isinstance(right, dict)
+        and left.get("xButton", False)
+        and right.get("aButton", False)
+    )
 
 
 def controller_hold_confirmed(status: Dict[str, Any]) -> bool:
