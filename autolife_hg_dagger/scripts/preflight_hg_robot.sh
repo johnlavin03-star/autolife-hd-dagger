@@ -79,10 +79,42 @@ if [ "$require_groot" -eq 1 ]; then
     fail "THOR token is missing: ${token_file}"
   fi
 
-  if curl --fail --silent --show-error --max-time 3 "${groot_url%/}/health" >/dev/null; then
-    pass "THOR health endpoint reachable: ${groot_url%/}/health"
-  else
-    fail "THOR health endpoint unavailable: ${groot_url%/}/health"
+  if [ -s "$token_file" ]; then
+    health_mode="$(python3 - "${groot_url%/}/health" "$token_file" <<'PY'
+import json
+import pathlib
+import sys
+import urllib.request
+
+url, token_path = sys.argv[1:]
+token = pathlib.Path(token_path).read_text(encoding="utf-8").strip()
+if not token:
+    raise SystemExit(2)
+request = urllib.request.Request(
+    url,
+    headers={"Authorization": f"Bearer {token}"},
+)
+try:
+    with urllib.request.urlopen(request, timeout=3.0) as response:
+        health = json.load(response)
+except Exception as exc:
+    print(f"THOR health request failed: {exc}", file=sys.stderr)
+    raise SystemExit(3)
+if health.get("ready") is not True or health.get("policy_type") != "groot":
+    print("THOR health is not ready for GR00T", file=sys.stderr)
+    raise SystemExit(4)
+mode = str(health.get("mode", ""))
+if mode not in {"policy_only_baseline", "policy_only_frame"}:
+    print(f"unsupported THOR mode: {mode or 'missing'}", file=sys.stderr)
+    raise SystemExit(5)
+print(mode)
+PY
+)"
+    if [ "$?" -eq 0 ] && [ -n "$health_mode" ]; then
+      pass "THOR authenticated health ready (${health_mode})"
+    else
+      fail "THOR authenticated health unavailable or incompatible: ${groot_url%/}/health"
+    fi
   fi
 fi
 
