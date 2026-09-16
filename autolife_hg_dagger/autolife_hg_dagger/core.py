@@ -161,6 +161,26 @@ def left_y_snapshot(packet: Dict[str, Any]) -> bool:
     return bool(controller.get("yButton", False)) if isinstance(controller, dict) else False
 
 
+def controller_hold_confirmed(status: Dict[str, Any]) -> bool:
+    """Accept both controller hold status formats used by deployed V4 stacks.
+
+    Newer controllers expose an explicit HOLDING state.  Robot 300 keeps the
+    top-level state ARMED while reporting the equivalent fail-safe barrier as
+    a measured-pose target with both clutch sides held.  Require all of those
+    fields so an ordinary ARMED state can never satisfy the handover barrier.
+    """
+    if status.get("state") == "HOLDING":
+        return True
+    held_sides = status.get("grip_release_held_sides")
+    return bool(
+        status.get("state") == "ARMED"
+        and status.get("hardware_ready") is True
+        and status.get("target_source") == "measured_hold"
+        and isinstance(held_sides, (list, tuple, set))
+        and {"left", "right"}.issubset(set(held_sides))
+    )
+
+
 def stamped_envelope(
     *, source: str, sequence: int, source_timestamp_ns: Optional[int],
     receive_wall_ns: int, receive_monotonic_ns: int, authority_epoch: int,

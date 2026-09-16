@@ -23,6 +23,7 @@ from std_srvs.srv import SetBool, Trigger
 from .core import (
     AuthorityStateMachine,
     Mode,
+    controller_hold_confirmed,
     grip_snapshot,
     left_y_snapshot,
     policy_to_controller,
@@ -530,7 +531,10 @@ class HgDaggerSupervisor(Node):
                     self._finish_intervention_locked(False, transition.reason)
                     self._event("transition", transition.reason, old=transition.old.value, new=transition.new.value)
                 return
-            if self._machine.mode == Mode.FAILURE_HOLD and status.get("state") == "HOLDING":
+            if (
+                self._machine.mode == Mode.FAILURE_HOLD
+                and controller_hold_confirmed(status)
+            ):
                 transition = self._machine.hold_confirmed()
                 self._release_gate_started_ns = time.monotonic_ns()
                 self._event("transition", transition.reason, old=transition.old.value, new=transition.new.value)

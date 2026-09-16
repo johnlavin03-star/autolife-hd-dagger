@@ -4,6 +4,7 @@ from autolife_hg_dagger.core import (
     AuthorityStateMachine,
     Mode,
     both_grips_released,
+    controller_hold_confirmed,
     grip_snapshot,
     left_y_snapshot,
     policy_to_controller,
@@ -70,3 +71,35 @@ def test_vr_gestures_from_existing_web_payload():
     assert grip_snapshot(packet) == (True, False)
     assert left_y_snapshot(packet)
     assert not both_grips_released(packet)
+
+
+def test_explicit_controller_holding_state_confirms_barrier():
+    assert controller_hold_confirmed({"state": "HOLDING"})
+
+
+def test_robot_300_measured_hold_confirms_barrier():
+    assert controller_hold_confirmed({
+        "state": "ARMED",
+        "hardware_ready": True,
+        "target_source": "measured_hold",
+        "grip_release_held_sides": ["left", "right"],
+    })
+
+
+@pytest.mark.parametrize("status", [
+    {"state": "ARMED", "hardware_ready": True},
+    {
+        "state": "ARMED",
+        "hardware_ready": True,
+        "target_source": "measured_hold",
+        "grip_release_held_sides": ["left"],
+    },
+    {
+        "state": "ARMED",
+        "hardware_ready": False,
+        "target_source": "measured_hold",
+        "grip_release_held_sides": ["left", "right"],
+    },
+])
+def test_ordinary_or_partial_armed_state_does_not_confirm_barrier(status):
+    assert not controller_hold_confirmed(status)
