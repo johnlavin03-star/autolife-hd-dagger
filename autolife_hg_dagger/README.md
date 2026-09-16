@@ -146,6 +146,10 @@ wrapper 直接使用原 recorder 的 `--action-arm-topic` / `--action-gripper-to
 300 当前适配值分别为 `/dev/video12` 和 `/dev/video10`，首次测试仍需在 VR
 画面中人工确认左右标签没有对调。
 
+300 的原生手部相机 SHM 实测为 10 Hz，因此 collector wrapper 在 robot_id=300
+时默认生成 10 Hz 数据集，避免把正常的 100 ms 参考帧间隔误判为 30 Hz 同步失败。
+可用 `HG_DAGGER_DATASET_FPS` 显式覆盖；覆盖前必须确认所有相机均能稳定达到目标频率。
+
 路径必须为绝对路径且可写；可以选择 NAS 挂载点，也可以在测试阶段显式选择本机目录。默认值为 `/home/ubuntu/hg_dagger_data`。
 
 collector 在等待失败期间维护同步 RGBD 环形缓存；接管 `start` 成功后，缓存前缀先进入同一个 LeRobot episode。若 episode 最终保存，失败前图像、状态和已仲裁动作会和后续 VR expert 数据一起落盘；若放弃则整条 episode 一并清除。

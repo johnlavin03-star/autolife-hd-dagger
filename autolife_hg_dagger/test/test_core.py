@@ -5,6 +5,7 @@ from autolife_hg_dagger.core import (
     Mode,
     both_grips_released,
     controller_hold_confirmed,
+    expert_timeout_requires_estop,
     grip_snapshot,
     left_y_snapshot,
     policy_to_controller,
@@ -103,3 +104,12 @@ def test_robot_300_measured_hold_confirms_barrier():
 ])
 def test_ordinary_or_partial_armed_state_does_not_confirm_barrier(status):
     assert not controller_hold_confirmed(status)
+
+
+def test_expert_pause_with_both_grips_released_is_not_estop():
+    assert not expert_timeout_requires_estop((False, False))
+
+
+@pytest.mark.parametrize("grips", [(True, False), (False, True), (True, True)])
+def test_expert_target_timeout_while_gripping_requires_estop(grips):
+    assert expert_timeout_requires_estop(grips)

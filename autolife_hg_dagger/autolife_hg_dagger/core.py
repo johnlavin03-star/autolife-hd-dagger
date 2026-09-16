@@ -181,6 +181,17 @@ def controller_hold_confirmed(status: Dict[str, Any]) -> bool:
     )
 
 
+def expert_timeout_requires_estop(grips: Tuple[bool, bool]) -> bool:
+    """A missing expert target is a fault only while an operator is gripping.
+
+    Releasing both Grips is the normal pause gesture: the controller holds its
+    measured pose and the expert may re-grip later.  If a Grip remains pressed,
+    loss of the target stream means the commanded controller path disappeared
+    while motion was requested and must fail closed.
+    """
+    return any(bool(value) for value in grips)
+
+
 def stamped_envelope(
     *, source: str, sequence: int, source_timestamp_ns: Optional[int],
     receive_wall_ns: int, receive_monotonic_ns: int, authority_epoch: int,

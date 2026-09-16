@@ -24,6 +24,7 @@ from .core import (
     AuthorityStateMachine,
     Mode,
     controller_hold_confirmed,
+    expert_timeout_requires_estop,
     grip_snapshot,
     left_y_snapshot,
     policy_to_controller,
@@ -314,6 +315,21 @@ class HgDaggerSupervisor(Node):
                 self._event(
                     "expert_regrip_detected",
                     "second Grip press accepted; waiting for re-anchored expert target",
+                )
+            elif (
+                grip_rising
+                and self._machine.mode == Mode.EXPERT_ACTIVE
+                and self._last_expert_monotonic_ns <= 0
+            ):
+                # Arm the watchdog while the mapper re-anchors.  A fresh EEF
+                # target replaces this timestamp immediately; no target while
+                # Grip remains held fails closed after expert_timeout_sec.
+                self._last_expert_monotonic_ns = envelope[
+                    "robot_receive_monotonic_ns"
+                ]
+                self._event(
+                    "expert_regrip_detected",
+                    "Grip pressed after expert pause; waiting for fresh target",
                 )
 
             event_type = packet.get("type")
@@ -725,17 +741,27 @@ class HgDaggerSupervisor(Node):
             elif self._machine.mode == Mode.EXPERT_ACTIVE and self._last_expert_monotonic_ns:
                 timeout = float(self.get_parameter("expert_timeout_sec").value)
                 if (now_ns - self._last_expert_monotonic_ns) / 1e9 > timeout:
-                    self._publish_release_hold("expert input watchdog timeout")
-                    transition = self._machine.estop(
-                        "expert input watchdog timeout"
-                    )
-                    self._finish_intervention_locked(False, transition.reason)
-                    self._event(
-                        "transition",
-                        transition.reason,
-                        old=transition.old.value,
-                        new=transition.new.value,
-                    )
+                    if expert_timeout_requires_estop(self._grips):
+                        self._publish_release_hold("expert input watchdog timeout")
+                        transition = self._machine.estop(
+                            "expert input watchdog timeout while Grip held"
+                        )
+                        self._finish_intervention_locked(False, transition.reason)
+                        self._event(
+                            "transition",
+                            transition.reason,
+                            old=transition.old.value,
+                            new=transition.new.value,
+                        )
+                    else:
+                        self._publish_release_hold(
+                            "expert paused with both Grips released"
+                        )
+                        self._last_expert_monotonic_ns = 0
+                        self._event(
+                            "expert_paused",
+                            "both Grips released; holding measured pose until re-grip",
+                        )
 
     def _publish_collector_action(self) -> None:
         with self._lock:
@@ -797,6 +823,10 @@ class HgDaggerSupervisor(Node):
                 "controller_state": self._controller_status.get("state"),
                 "controller_reason": self._controller_status.get("reason"),
                 "grips": {"left": self._grips[0], "right": self._grips[1]},
+                "expert_paused": bool(
+                    self._machine.mode == Mode.EXPERT_ACTIVE
+                    and not any(self._grips)
+                ),
                 "policy_warmup": {
                     "accepted_actions": self._policy_warmup_count,
                     "required_actions": int(self.get_parameter(
@@ -816,7 +846,11 @@ class HgDaggerSupervisor(Node):
                 ),
                 Mode.EXPERT_RELEASE_REQUIRED: "机器人已保持：请松开左右 Grip",
                 Mode.EXPERT_READY: "已确认松开：请重新按 Grip，从当前位置接管",
-                Mode.EXPERT_ACTIVE: "VR 专家接管中",
+                Mode.EXPERT_ACTIVE: (
+                    "VR 专家接管中"
+                    if any(self._grips)
+                    else "VR 专家已暂停：按 Grip 从当前位置重新锚定并继续"
+                ),
                 Mode.POLICY_WARMUP: "VR 已交还；正在验证 VLA 连续输出",
                 Mode.ESTOP: "HG-DAgger 已停止输出，请检查故障",
                 Mode.DISARMED: "HG-DAgger 会话未使能",

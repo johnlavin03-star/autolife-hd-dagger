@@ -109,6 +109,16 @@ start_one() {
   local pid_file="${session_dir}/.hg_dagger_recorder.pid"
   local log_dir="${session_dir}/logs"
   local log_file="${log_dir}/hg_dagger_recorder_$(date +%Y%m%d_%H%M%S).log"
+  local default_dataset_fps=30
+  local max_sync_delta_sec=0.03
+  if [ "${robot_id}" = "300" ]; then
+    # Robot 300's native hand-camera SHM streams are 10 Hz. Recording a
+    # nominal 30 Hz episode makes every real 100 ms hand-camera interval fail
+    # the strict reference cadence check and invalidates the episode.
+    default_dataset_fps=10
+    max_sync_delta_sec=0.05
+  fi
+  local dataset_fps="${HG_DAGGER_DATASET_FPS:-${default_dataset_fps}}"
 
   mkdir -p "${session_dir}" "${log_dir}"
   if [ -f "${pid_file}" ]; then
@@ -128,11 +138,11 @@ start_one() {
     --repo-id "local/${task_name}_hg_dagger_${variant}"
     --task-name "${task_text}"
     --motion-lock-file "/tmp/lerobot_robot_${topic_suffix}.motion.lock"
-    --fps 30
+    --fps "${dataset_fps}"
     --image-source shm
     --image-poll-fps 120
     --min-cameras "${min_cameras}"
-    --max-sync-delta-sec 0.03
+    --max-sync-delta-sec "${max_sync_delta_sec}"
     --max-image-age-sec 0.15
     --max-state-age-sec 0.15
     --max-state-interpolation-gap-sec 0.05
