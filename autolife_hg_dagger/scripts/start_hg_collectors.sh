@@ -111,14 +111,13 @@ start_one() {
   local log_file="${log_dir}/hg_dagger_recorder_$(date +%Y%m%d_%H%M%S).log"
   local default_dataset_fps=30
   local max_sync_delta_sec=0.03
-  if [ "${robot_id}" = "300" ]; then
-    # Robot 300's native hand-camera SHM streams are 10 Hz. Recording a
-    # nominal 30 Hz episode makes every real 100 ms hand-camera interval fail
-    # the strict reference cadence check and invalidates the episode.
-    default_dataset_fps=10
-    max_sync_delta_sec=0.05
-  fi
   local dataset_fps="${HG_DAGGER_DATASET_FPS:-${default_dataset_fps}}"
+
+  if ! grep -q "HG-DAGGER pre-roll/live boundary" "${recorder}"; then
+    echo "ERROR: collector pre-roll boundary fix is not installed: ${recorder}" >&2
+    echo "Run autolife_hg_dagger/scripts/setup_hg_collector_env.sh first." >&2
+    return 1
+  fi
 
   mkdir -p "${session_dir}" "${log_dir}"
   if [ -f "${pid_file}" ]; then

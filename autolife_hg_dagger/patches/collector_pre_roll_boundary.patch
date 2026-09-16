@@ -1,0 +1,17 @@
+--- record_lerobot_official.py
++++ record_lerobot_official.py
+@@ -1454,8 +1454,13 @@
+         self.session_frames_written += len(prefix)
+         self.is_recording = True
+         if prefix:
+             self.last_reference_stamp_sec = prefix[-1][1]
+-            self.last_episode_anchor_stamp_sec = prefix[-1][1]
++            # HG-DAGGER pre-roll/live boundary: seeding several seconds of
++            # materialized frames briefly blocks the single-threaded image
++            # poller. Keep the causal lower bound so old frames cannot be
++            # reused, but exempt only the first live frame from cadence
++            # validation. All following live intervals remain strict.
++            self.last_episode_anchor_stamp_sec = None
+         # Start a fresh reporting window so time spent paused between episodes
+         # does not artificially lower the displayed effective FPS.
+         self.started_sec = time.time()

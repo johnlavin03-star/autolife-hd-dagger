@@ -14,6 +14,7 @@ setup(
         ("share/" + package_name + "/launch", glob("launch/*.launch.py")),
         ("share/" + package_name + "/config", glob("config/*.yaml")),
         ("share/" + package_name + "/scripts", glob("scripts/*.sh")),
+        ("share/" + package_name + "/patches", glob("patches/*.patch")),
     ],
     install_requires=["setuptools"],
     tests_require=["pytest"],

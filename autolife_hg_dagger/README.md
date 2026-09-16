@@ -146,9 +146,15 @@ wrapper 直接使用原 recorder 的 `--action-arm-topic` / `--action-gripper-to
 300 当前适配值分别为 `/dev/video12` 和 `/dev/video10`，首次测试仍需在 VR
 画面中人工确认左右标签没有对调。
 
-300 的原生手部相机 SHM 实测为 10 Hz，因此 collector wrapper 在 robot_id=300
-时默认生成 10 Hz 数据集，避免把正常的 100 ms 参考帧间隔误判为 30 Hz 同步失败。
-可用 `HG_DAGGER_DATASET_FPS` 显式覆盖；覆盖前必须确认所有相机均能稳定达到目标频率。
+开始采集前需安装一次 HG-DAGGER 的 collector 边界补丁：
+
+```bash
+bash /home/ubuntu/ros2_ws/src/autolife-hd-dagger/autolife_hg_dagger/scripts/setup_hg_collector_env.sh
+```
+
+补丁只豁免从已物化 pre-roll 切换到实时流时的首帧间隔检查；它保留因果
+下界，且后续实时帧仍执行严格的 30 Hz 时序检查。wrapper 会 fail-closed：缺少
+补丁时拒绝启动 recorder，避免再次生成必然被丢弃的 episode。
 
 路径必须为绝对路径且可写；可以选择 NAS 挂载点，也可以在测试阶段显式选择本机目录。默认值为 `/home/ubuntu/hg_dagger_data`。
 
