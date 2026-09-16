@@ -6,6 +6,7 @@ task_text="${2:-${task_name}}"
 data_root="${3:-${HG_DAGGER_DATA_ROOT:-/home/ubuntu/hg_dagger_data}}"
 collector_root="${HG_DAGGER_COLLECTOR_ROOT:-/home/ubuntu/lerobot_data_collector}"
 lerobot_py="${LEROBOT_PY:-/home/ubuntu/miniconda3/envs/lerobot/bin/python}"
+robot_py="${ROBOT_ENV_PY:-/home/ubuntu/miniconda3/envs/robot_env/bin/python}"
 robot_id="${HG_DAGGER_ROBOT_ID:-${ROBOT_ID:-328}}"
 topic_suffix="${HG_DAGGER_TOPIC_SUFFIX:-0_${robot_id}}"
 
@@ -45,7 +46,56 @@ set -u
 ros_ld_library_path="${LD_LIBRARY_PATH:-}"
 ros_pythonpath="${PYTHONPATH:-}"
 lerobot_env_lib="/home/ubuntu/miniconda3/envs/lerobot/lib"
+robot_env_lib="/home/ubuntu/miniconda3/envs/robot_env/lib"
 cyclonedds_uri='<CycloneDDS><Domain><General><NetworkInterfaceAddress>127.0.0.1</NetworkInterfaceAddress></General><Discovery><ParticipantIndex>auto</ParticipantIndex><MaxAutoParticipantIndex>120</MaxAutoParticipantIndex></Discovery></Domain></CycloneDDS>'
+
+start_hand_producer() {
+  local requested="${HG_DAGGER_START_HAND_PRODUCER:-auto}"
+  local session_dir="${data_root}/${task_name}/hg_dagger_rgbd"
+  local log_dir="${session_dir}/logs"
+  local pid_file="${session_dir}/.hg_dagger_hand_producer.pid"
+  local producer="${collector_root}/hand_camera_producer.py"
+
+  mkdir -p "${session_dir}" "${log_dir}"
+  if [ -f "${pid_file}" ]; then
+    local existing_pid
+    existing_pid="$(cat "${pid_file}")"
+    if [ -n "${existing_pid}" ] && kill -0 "${existing_pid}" 2>/dev/null; then
+      echo "Hand-camera producer already running as PID ${existing_pid}"
+      return 0
+    fi
+  fi
+  if [ "${requested}" = "0" ]; then
+    echo "Hand-camera producer disabled by HG_DAGGER_START_HAND_PRODUCER=0"
+    return 0
+  fi
+  if [ "${requested}" = "auto" ] \
+      && [ -s /dev/shm/camera_metadata_struct_hand_left ] \
+      && [ -s /dev/shm/camera_metadata_struct_hand_right ]; then
+    echo "Reusing existing hand-camera SHM streams"
+    return 0
+  fi
+  if [ ! -x "${robot_py}" ] || [ ! -f "${producer}" ]; then
+    echo "ERROR: hand-camera producer environment is unavailable" >&2
+    return 1
+  fi
+
+  local log_file="${log_dir}/hg_dagger_hand_camera_$(date +%Y%m%d_%H%M%S).log"
+  nohup env \
+    LD_LIBRARY_PATH="${robot_env_lib}:${ros_ld_library_path}" \
+    PYTHONPATH="${collector_root}:${ros_pythonpath}" \
+    HAND_LEFT_CAMERA_DEVICE="${HG_DAGGER_HAND_LEFT_DEVICE:-/dev/video12}" \
+    HAND_RIGHT_CAMERA_DEVICE="${HG_DAGGER_HAND_RIGHT_DEVICE:-/dev/video10}" \
+    "${robot_py}" "${producer}" >"${log_file}" 2>&1 &
+  local producer_pid=$!
+  echo "${producer_pid}" > "${pid_file}"
+  sleep 1
+  if ! kill -0 "${producer_pid}" 2>/dev/null; then
+    echo "ERROR: hand-camera producer exited during startup; see ${log_file}" >&2
+    return 1
+  fi
+  echo "Started hand-camera producer: PID=${producer_pid}, log=${log_file}"
+}
 
 start_one() {
   local variant="$1"
@@ -117,6 +167,7 @@ start_one() {
   echo "Started ${variant}: PID=${recorder_pid}, FIFO=${fifo}, log=${log_file}"
 }
 
+start_hand_producer
 start_one rgbd 1 4
 echo "RGBD collector is continuously buffering synchronized pre-roll frames in paused mode."
 echo "It creates an episode only after an HG-DAGGER 'start' command."

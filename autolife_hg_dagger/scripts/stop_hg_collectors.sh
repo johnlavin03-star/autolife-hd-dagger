@@ -32,3 +32,18 @@ for variant in rgb rgbd; do
   rm -f "${pid_file}" "${session_dir}/.official_recording_control"
   echo "${variant}: stopped"
 done
+
+hand_session_dir="${data_root}/${task_name}/hg_dagger_rgbd"
+hand_pid_file="${hand_session_dir}/.hg_dagger_hand_producer.pid"
+if [ -f "${hand_pid_file}" ]; then
+  hand_pid="$(cat "${hand_pid_file}")"
+  if [ -n "${hand_pid}" ] && kill -0 "${hand_pid}" 2>/dev/null; then
+    kill -TERM "${hand_pid}" 2>/dev/null || true
+    for _ in $(seq 1 40); do
+      kill -0 "${hand_pid}" 2>/dev/null || break
+      sleep 0.25
+    done
+  fi
+  rm -f "${hand_pid_file}"
+  echo "hand producer: stopped"
+fi

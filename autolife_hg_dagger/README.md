@@ -121,6 +121,12 @@ ros2 launch autolife_hg_dagger hg_dagger_vr.launch.py \
 
 wrapper 直接使用原 recorder 的 `--action-arm-topic` / `--action-gripper-topic` 参数指向 HG-DAGGER 的两个 label topic。停止时运行 `stop_hg_collectors.sh my_task /path/to/hg_data`。
 
+若左右手部相机 SHM 尚未存在，wrapper 默认会启动并管理
+`hand_camera_producer.py`。可用 `HG_DAGGER_START_HAND_PRODUCER=0` 禁用；设备号可通过
+`HG_DAGGER_HAND_LEFT_DEVICE` 和 `HG_DAGGER_HAND_RIGHT_DEVICE` 显式覆盖。
+300 当前适配值分别为 `/dev/video12` 和 `/dev/video10`，首次测试仍需在 VR
+画面中人工确认左右标签没有对调。
+
 路径必须为绝对路径且可写；可以选择 NAS 挂载点，也可以在测试阶段显式选择本机目录。默认值为 `/home/ubuntu/hg_dagger_data`。
 
 collector 在等待失败期间维护同步 RGBD 环形缓存；接管 `start` 成功后，缓存前缀先进入同一个 LeRobot episode。若 episode 最终保存，失败前图像、状态和已仲裁动作会和后续 VR expert 数据一起落盘；若放弃则整条 episode 一并清除。
