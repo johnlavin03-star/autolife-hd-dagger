@@ -138,7 +138,12 @@ ros2 launch autolife_hg_dagger hg_dagger_vr.launch.py \
   robot_id:=307 dry_run:=true task_name:=my_task data_root:=/path/to/hg_data
 ```
 
-数据目录是 `/path/to/hg_data/my_task/hg_dagger_rgbd/dataset`；控制 FIFO 位于其父目录。collector 和 launch 必须使用同一个 `data_root`。
+数据目录是 `/path/to/hg_data/my_task/hg_dagger_rgbd/atomic_dataset_v1`；
+控制 FIFO 位于其父目录。collector 和 launch 必须使用同一个
+`data_root`。每次接管先写 `.staging/<episode_id>`，完成 Parquet footer、
+四路视频编码和帧数校验后，才会原子移到 `episodes/<episode_id>` 并
+fsync 追加 `episode_index.jsonl`。因此索引内的 episode 才是可供后续
+导出/训练的已提交数据。
 
 wrapper 直接使用原 recorder 的 `--action-arm-topic` / `--action-gripper-topic` 参数指向 HG-DAGGER 的两个 label topic。停止时运行 `stop_hg_collectors.sh my_task /path/to/hg_data`。
 
@@ -148,16 +153,32 @@ wrapper 直接使用原 recorder 的 `--action-arm-topic` / `--action-gripper-to
 300 当前适配值分别为 `/dev/video12` 和 `/dev/video10`，首次测试仍需在 VR
 画面中人工确认左右标签没有对调。
 
-开始采集前需安装一次 HG-DAGGER 的 collector 边界补丁：
+开始采集前需安装一次仓库内固定版本的 HG-DAGGER atomic
+collector：
 
 ```bash
 bash /home/ubuntu/ros2_ws/src/autolife-hd-dagger/autolife_hg_dagger/scripts/setup_hg_collector_env.sh
 ```
 
-补丁只豁免从已物化 pre-roll 切换到实时流时的首帧间隔检查；它保留因果
-下界，且后续实时帧仍执行严格的 30 Hz 时序检查。wrapper 会 fail-closed：缺少
-补丁时拒绝启动 recorder，避免再次生成必然被丢弃的 episode。
+安装脚本会先备份机器人上的旧 recorder，再复制仓库版本并执行
+`py_compile`。wrapper 会 fail-closed：不是 atomic 版 collector 就拒绝启动。
 
 路径必须为绝对路径且可写；可以选择 NAS 挂载点，也可以在测试阶段显式选择本机目录。默认值为 `/home/ubuntu/hg_dagger_data`。
 
 collector 在等待失败期间维护同步 RGBD 环形缓存；接管 `start` 成功后，缓存前缀先进入同一个 LeRobot episode。若 episode 最终保存，失败前图像、状态和已仲裁动作会和后续 VR expert 数据一起落盘；若放弃则整条 episode 一并清除。
+
+每帧还写入 `metadata.control_mode`、`authority_epoch`、`train_mask`、
+`pre_failure`、`failure_boundary` 和 `anchor_timestamp_ns`。`train_mask=1`
+仅表示当时处于未暂停、未复位的 `EXPERT_ACTIVE`；训练导出不应把
+pre-roll/HOLD 动作当成 expert label。上一条 episode 后台编码时，同一
+会话仍可立即开始新接管；只有关闭后立即重新启用会话时会等待全部落盘。
+
+停止采集器后，用 LeRobot 环境做完整性审计：
+
+```bash
+/home/ubuntu/miniconda3/envs/lerobot/bin/python \
+  /home/ubuntu/ros2_ws/src/autolife-hd-dagger/autolife_hg_dagger/scripts/validate_hg_atomic_dataset.py \
+  /path/to/hg_data/my_task/hg_dagger_rgbd/atomic_dataset_v1
+```
+
+只有输出 `PASS` 且 `.staging` 为空，才把该批数据交给后续导出器。

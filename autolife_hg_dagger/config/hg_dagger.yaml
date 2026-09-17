@@ -23,7 +23,7 @@ hg_dagger_supervisor:
     collector_start_command: "start"
     collector_save_command: "save"
     collector_discard_command: "discard"
-    collector_command_timeout_sec: 4.0
-    collector_finalize_timeout_sec: 120.0
+    collector_command_timeout_sec: 15.0
+    collector_finalize_timeout_sec: 600.0
     vendor_joint_command_topic: "/topic_arm_whole_body_target_joints_position_0_328"
     vendor_gripper_command_topic: "/topic_arm_gripper_target_joints_position_0_328"

@@ -102,7 +102,7 @@ start_one() {
   local with_depth="$2"
   local min_cameras="$3"
   local session_dir="${data_root}/${task_name}/hg_dagger_${variant}"
-  local dataset_root="${session_dir}/dataset"
+  local dataset_root="${session_dir}/atomic_dataset_v1"
   local fifo="${session_dir}/.official_recording_control"
   local status_file="${session_dir}/.official_recording_status.json"
   local event_file="${session_dir}/.official_episode_event.json"
@@ -113,8 +113,8 @@ start_one() {
   local max_sync_delta_sec=0.03
   local dataset_fps="${HG_DAGGER_DATASET_FPS:-${default_dataset_fps}}"
 
-  if ! grep -q "HG-DAGGER pre-roll/live boundary" "${recorder}"; then
-    echo "ERROR: collector pre-roll boundary fix is not installed: ${recorder}" >&2
+  if ! grep -q "HG-DAGGER atomic episode store" "${recorder}"; then
+    echo "ERROR: HG-DAGGER atomic collector is not installed: ${recorder}" >&2
     echo "Run autolife_hg_dagger/scripts/setup_hg_collector_env.sh first." >&2
     return 1
   fi
@@ -129,11 +129,15 @@ start_one() {
     fi
   fi
   rm -f "${fifo}" "${status_file}" "${event_file}"
+  mkdir -p "${status_file}.d"
+  find "${status_file}.d" -maxdepth 1 -type f -mtime +7 -delete
   mkfifo "${fifo}"
 
   local args=(
     "${recorder}"
     --output-dir "${dataset_root}"
+    --atomic-episodes
+    --dagger-metadata
     --repo-id "local/${task_name}_hg_dagger_${variant}"
     --task-name "${task_text}"
     --motion-lock-file "/tmp/lerobot_robot_${topic_suffix}.motion.lock"
@@ -153,6 +157,7 @@ start_one() {
     --with-head
     --with-upper-waist
     --state-topic "/topic_arm_whole_body_and_gripper_current_joints_status_${topic_suffix}"
+    --control-state-topic /hg_dagger/control_state
     --action-arm-topic /hg_dagger/collector/arm_action
     --action-gripper-topic /hg_dagger/collector/gripper_action
     --control-fifo "${fifo}"

@@ -166,10 +166,18 @@ class CollectorFifo:
         self, depth: bool, command: str, request_id: str, timeout: float = 3.0
     ) -> CollectorCommandResult:
         status_path = Path(self.paths[bool(depth)]).parent / ".official_recording_status.json"
+        request_status_path = (
+            status_path.parent / f"{status_path.name}.d" / f"{request_id}.json"
+        )
         deadline = time.monotonic() + max(0.1, float(timeout))
         while time.monotonic() < deadline:
             try:
-                payload = json.loads(status_path.read_text(encoding="utf-8"))
+                selected = (
+                    request_status_path
+                    if request_status_path.exists()
+                    else status_path
+                )
+                payload = json.loads(selected.read_text(encoding="utf-8"))
             except (FileNotFoundError, OSError, json.JSONDecodeError):
                 time.sleep(0.02)
                 continue

@@ -76,7 +76,11 @@ class HgDaggerSupervisor(Node):
         self._policy_warmup_reference_jump_deg = 0.0
         self._policy_warmup_rejection = ""
         self._last_failure_reason = ""
-        self._collector_finalize_pending = False
+        # Atomic collector episodes can encode concurrently.  Keep a count for
+        # shutdown/re-enable visibility, but never block another intervention
+        # inside the same enabled session merely because an earlier episode is
+        # still being packed.
+        self._collector_finalize_pending = 0
         self._reset_chord_started_ns = 0
         self._reset_chord_consumed = False
         self._dagger_reset_pending = False
@@ -210,8 +214,8 @@ class HgDaggerSupervisor(Node):
             "collector_start_command": "start",
             "collector_save_command": "save",
             "collector_discard_command": "discard",
-            "collector_command_timeout_sec": 4.0,
-            "collector_finalize_timeout_sec": 120.0,
+            "collector_command_timeout_sec": 15.0,
+            "collector_finalize_timeout_sec": 600.0,
             "vendor_joint_command_topic": "/topic_arm_whole_body_target_joints_position_0_328",
             "vendor_gripper_command_topic": "/topic_arm_gripper_target_joints_position_0_328",
         }
@@ -284,12 +288,6 @@ class HgDaggerSupervisor(Node):
         self._expert_command_pending = False
         self._publish_release_hold(reason)
         self._event("transition", transition.reason, old=transition.old.value, new=transition.new.value)
-        if self._collector_finalize_pending:
-            self._event(
-                "takeover_recording_deferred",
-                "robot is holding while the previous RGBD episode finishes",
-            )
-            return
         # Freeze the rolling pre-failure window at the failure boundary. Waiting
         # until the operator completes release/re-grip would let that window roll
         # forward and could evict the actual failure context.
@@ -752,10 +750,6 @@ class HgDaggerSupervisor(Node):
     def _start_intervention_locked(
         self, *, failure_context_valid: bool = True
     ) -> None:
-        if self._collector_finalize_pending:
-            raise RuntimeError(
-                "previous RGBD episode is still being finalized"
-            )
         self._intervention_id = f"int-{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
         self._active_depth = self._depth_next
         self._expert_command_count = 0
@@ -832,7 +826,7 @@ class HgDaggerSupervisor(Node):
                     reason,
                     pending_result,
                 )
-                self._collector_finalize_pending = True
+                self._collector_finalize_pending += 1
                 self._intervention_id = ""
                 self._recorder_active = False
                 threading.Thread(
@@ -917,7 +911,9 @@ class HgDaggerSupervisor(Node):
                     f"failed to update finalized intervention manifest: {exc}"
                 )
         with self._lock:
-            self._collector_finalize_pending = False
+            self._collector_finalize_pending = max(
+                0, self._collector_finalize_pending - 1
+            )
             self._event(
                 "intervention_finished",
                 reason,
@@ -1120,7 +1116,8 @@ class HgDaggerSupervisor(Node):
                     ),
                     "rejection": self._policy_warmup_rejection,
                 },
-                "collector_finalize_pending": self._collector_finalize_pending,
+                "collector_finalize_pending": bool(self._collector_finalize_pending),
+                "collector_finalize_pending_count": self._collector_finalize_pending,
                 "quick_reset": {
                     "pending": self._dagger_reset_pending,
                     "active": self._dagger_reset_active,
@@ -1133,13 +1130,9 @@ class HgDaggerSupervisor(Node):
             prompts = {
                 Mode.POLICY_ACTIVE: "VLA 正在控制；按 Grip 请求人工接管",
                 Mode.FAILURE_HOLD: (
-                    "上一段数据保存中；机器人保持，保存完成后继续接管"
-                    if self._collector_finalize_pending
-                    else (
-                        "失败已触发："
-                        + (self._last_failure_reason or "VLA/操作者请求")
-                        + "；正在停止 VLA 并等待机器人保持"
-                    )
+                    "失败已触发："
+                    + (self._last_failure_reason or "VLA/操作者请求")
+                    + "；正在停止 VLA 并等待机器人保持"
                 ),
                 Mode.EXPERT_RELEASE_REQUIRED: "机器人已保持：请松开左右 Grip",
                 Mode.EXPERT_READY: "已确认松开：请重新按 Grip，从当前位置接管",

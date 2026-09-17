@@ -72,3 +72,48 @@ def test_fifo_command_requires_correlated_ack(tmp_path):
     thread.join(timeout=1.0)
     assert result.acknowledged and result.success
     assert result.episode_index == 4
+
+
+def test_fifo_uses_request_scoped_ack_during_overlapping_pack(tmp_path):
+    fifo_path = tmp_path / "rgb" / ".official_recording_control"
+    fifo_path.parent.mkdir()
+    status_path = fifo_path.parent / ".official_recording_status.json"
+    status_dir = fifo_path.parent / ".official_recording_status.json.d"
+    status_dir.mkdir()
+    fifo = CollectorFifo(str(fifo_path), str(tmp_path / "rgbd"))
+    request_id = "matching-request"
+
+    def collector():
+        # Simulate a different background packer completing first and
+        # overwriting the legacy shared status file.
+        status_path.write_text(
+            json.dumps({
+                "event": "save",
+                "success": True,
+                "request_id": "older-request",
+                "episode_index": 2,
+                "frames": 90,
+                "message": "older pack complete",
+            }),
+            encoding="utf-8",
+        )
+        time.sleep(0.03)
+        (status_dir / f"{request_id}.json").write_text(
+            json.dumps({
+                "event": "save",
+                "success": True,
+                "request_id": request_id,
+                "episode_index": 7,
+                "frames": 120,
+                "message": "matching pack complete",
+            }),
+            encoding="utf-8",
+        )
+
+    thread = threading.Thread(target=collector)
+    thread.start()
+    result = fifo.wait_for_result(False, "save", request_id, timeout=1.0)
+    thread.join(timeout=1.0)
+    assert result.acknowledged and result.success
+    assert result.episode_index == 7
+    assert result.frames == 120

@@ -10,11 +10,11 @@ RGB frames are stored as ordinary LeRobot video features.  With LeRobot 0.6 or
 newer, the optional uint16 depth stream is stored through the native depth-video
 pipeline, preserving physical depth instead of converting it to an 8-bit image.
 
-Batch collection behavior:
-* start   -> begin accumulating a new episode buffer
-* save    -> save current episode buffer into the same dataset root
-* discard -> drop current episode buffer and keep the dataset untouched
-* quit    -> save pending frames (if any) and stop the whole recording session
+HG-DAGGER atomic episode store behavior:
+* start   -> create an isolated staging dataset and seed its pre-roll
+* save    -> encode/validate in the background, then atomically commit it
+* discard -> detach and asynchronously delete only that staging dataset
+* quit    -> finish pending work before stopping the recording session
 
 Each dataset frame is anchored to a new reference-camera timestamp.  Other
 cameras, state, and action are selected from short buffers by nearest timestamp
@@ -35,6 +35,7 @@ import signal
 import socket
 import threading
 import time
+import uuid
 from collections import Counter, deque
 from dataclasses import dataclass
 from pathlib import Path
@@ -142,9 +143,52 @@ def write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
     """Replace a small JSON IPC file without exposing a partial document."""
 
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    temporary_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    temporary_path = path.with_name(
+        f".{path.name}.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex}.tmp"
+    )
+    with temporary_path.open("w", encoding="utf-8") as handle:
+        handle.write(json.dumps(payload, ensure_ascii=False))
+        handle.flush()
+        os.fsync(handle.fileno())
     os.replace(temporary_path, path)
+    fsync_directory(path.parent)
+
+
+def fsync_directory(path: Path) -> None:
+    """Persist directory-entry changes on POSIX; harmlessly degrade elsewhere."""
+
+    flags = getattr(os, "O_DIRECTORY", 0) | os.O_RDONLY
+    try:
+        descriptor = os.open(path, flags)
+    except OSError:
+        return
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def append_jsonl_durable(path: Path, payload: dict[str, Any]) -> None:
+    """Append one collection-index row and fsync it before reporting success."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+CONTROL_MODE_CODES = {
+    "UNKNOWN": 0,
+    "DISARMED": 1,
+    "POLICY_ACTIVE": 2,
+    "FAILURE_HOLD": 3,
+    "EXPERT_RELEASE_REQUIRED": 4,
+    "EXPERT_READY": 5,
+    "EXPERT_ACTIVE": 6,
+    "POLICY_WARMUP": 7,
+    "ESTOP": 8,
+}
 
 
 def parse_json_payload(text: str) -> Any | None:
@@ -253,6 +297,8 @@ def dataset_features(
     active_images: dict[str, ImageSample],
     state_names: tuple[str, ...],
     action_names: tuple[str, ...] | list[str],
+    *,
+    dagger_metadata: bool = False,
 ) -> dict[str, dict[str, Any]]:
     """Create metadata directly from the resolved schema and live cameras."""
 
@@ -260,6 +306,27 @@ def dataset_features(
         "observation.state": {"dtype": "float32", "shape": (len(state_names),), "names": list(state_names)},
         "action": {"dtype": "float32", "shape": (len(action_names),), "names": list(action_names)},
     }
+    if dagger_metadata:
+        features.update({
+            "metadata.control_mode": {
+                "dtype": "int64", "shape": (1,), "names": ["control_mode_code"],
+            },
+            "metadata.authority_epoch": {
+                "dtype": "int64", "shape": (1,), "names": ["authority_epoch"],
+            },
+            "metadata.train_mask": {
+                "dtype": "int64", "shape": (1,), "names": ["expert_action_is_trainable"],
+            },
+            "metadata.pre_failure": {
+                "dtype": "int64", "shape": (1,), "names": ["is_pre_failure_context"],
+            },
+            "metadata.failure_boundary": {
+                "dtype": "int64", "shape": (1,), "names": ["is_first_post_failure_frame"],
+            },
+            "metadata.anchor_timestamp_ns": {
+                "dtype": "int64", "shape": (1,), "names": ["robot_wall_timestamp_ns"],
+            },
+        })
     for camera_name, latest in active_images.items():
         feature = {
             "dtype": "video",
@@ -319,6 +386,20 @@ class OfficialLeRobotRecorder(Node):
             with_upper_waist=args.with_upper_waist,
         )
         self.dataset: LeRobotDataset | None = None
+        self.atomic_root = Path(args.output_dir).expanduser().resolve()
+        self.atomic_staging_root = self.atomic_root / ".staging"
+        self.atomic_episode_root = self.atomic_root / "episodes"
+        self.atomic_failed_root = self.atomic_root / ".failed"
+        self.atomic_index_path = self.atomic_root / "episode_index.jsonl"
+        self.active_atomic_id: str | None = None
+        self.active_atomic_sequence: int | None = None
+        self.active_atomic_staging: Path | None = None
+        self.active_atomic_final: Path | None = None
+        self.active_request_id: str | None = None
+        self._background_jobs: set[threading.Thread] = set()
+        self._background_lock = threading.Lock()
+        self._index_lock = threading.Lock()
+        self._sync_log_lock = threading.Lock()
         self.active_cameras: list[str] = []
         self.channel_first_cameras: set[str] = set()
         self.stop_requested = False
@@ -332,6 +413,7 @@ class OfficialLeRobotRecorder(Node):
         self.episodes_invalidated = 0
         self.image_buffer_overflows = 0
         self.current_episode_frames = 0
+        self.active_pre_roll_frames = 0
         self.saved_episodes = 0
         self.discarded_episodes = 0
         self.task_episode_counts: Counter[str] = Counter()
@@ -364,6 +446,7 @@ class OfficialLeRobotRecorder(Node):
         self.action_gripper_buffer: deque[TimedSample] = deque(maxlen=args.sync_signal_buffer_size)
         self.action_eef_buffer: deque[TimedSample] = deque(maxlen=args.sync_signal_buffer_size)
         self.action_height_buffer: deque[TimedSample] = deque(maxlen=args.sync_signal_buffer_size)
+        self.control_state_buffer: deque[TimedSample] = deque(maxlen=args.sync_signal_buffer_size)
         self.sync_reference_camera: str | None = None
         self.last_reference_stamp_sec: float | None = None
         self.last_episode_anchor_stamp_sec: float | None = None
@@ -400,6 +483,10 @@ class OfficialLeRobotRecorder(Node):
         self.create_subscription(String, args.action_gripper_topic, self._action_gripper_cb, 20)
         self.create_subscription(String, args.action_eef_topic, self._action_eef_cb, 20)
         self.create_subscription(String, args.action_height_topic, self._action_height_cb, 20)
+        if args.dagger_metadata:
+            self.create_subscription(
+                String, args.control_state_topic, self._control_state_cb, 20
+            )
         self.get_logger().info(f"state topic: {args.state_topic}")
         self.get_logger().info(f"state/action joints ({self.schema.size}): {', '.join(self.schema.names)}")
         self.get_logger().info(f"action mode: {args.action_mode}")
@@ -407,6 +494,10 @@ class OfficialLeRobotRecorder(Node):
         self.get_logger().info(f"action gripper topic: {args.action_gripper_topic}")
         self.get_logger().info(f"action eef topic: {args.action_eef_topic}")
         self.get_logger().info(f"action height topic: {args.action_height_topic}")
+        if args.dagger_metadata:
+            self.get_logger().info(
+                f"HD-DAgger metadata topic: {args.control_state_topic}"
+            )
 
     def _make_image_cb(self, camera_name: str, is_depth_map: bool):
         def cb(msg: Image) -> None:
@@ -610,6 +701,34 @@ class OfficialLeRobotRecorder(Node):
     def _action_height_cb(self, msg: String) -> None:
         self._store_action(msg, parse_height_action, self.action_height_buffer)
 
+    def _control_state_cb(self, msg: String) -> None:
+        obj = parse_json_payload(msg.data)
+        if not isinstance(obj, dict):
+            return
+        received_sec = time.time()
+        mode = str(obj.get("mode", "UNKNOWN"))
+        quick_reset = obj.get("quick_reset")
+        reset_active = bool(
+            isinstance(quick_reset, dict)
+            and (quick_reset.get("pending") or quick_reset.get("active"))
+        )
+        expert_paused = bool(obj.get("expert_paused", False))
+        trainable = bool(
+            mode == "EXPERT_ACTIVE" and not expert_paused and not reset_active
+        )
+        value = {
+            "mode": mode,
+            "mode_code": CONTROL_MODE_CODES.get(mode, 0),
+            "authority_epoch": int(obj.get("authority_epoch", 0) or 0),
+            "train_mask": int(trainable),
+            "intervention_id": str(obj.get("intervention_id", "")),
+            "expert_paused": expert_paused,
+            "quick_reset": reset_active,
+        }
+        self.control_state_buffer.append(
+            TimedSample(value=value, stamp_sec=received_sec, received_sec=received_sec)
+        )
+
     def _control_fifo_loop(self) -> None:
         if not self.args.control_fifo:
             return
@@ -712,6 +831,13 @@ class OfficialLeRobotRecorder(Node):
         }
         status_path = Path(self.args.status_file)
         write_json_atomic(status_path, payload)
+        if request_id:
+            request_status = (
+                status_path.parent
+                / f"{status_path.name}.d"
+                / f"{request_id}.json"
+            )
+            write_json_atomic(request_status, payload)
 
     def _validate_resume_schema(self, info: dict[str, Any]) -> None:
         """Reject changes that LeRobot cannot append to an existing dataset.
@@ -785,6 +911,186 @@ class OfficialLeRobotRecorder(Node):
                 "vector order is compatible, but metadata names remain unchanged"
             )
 
+    def _configure_active_cameras(self, active: dict[str, ImageSample]) -> None:
+        self.active_cameras = list(active)
+        if not self.active_cameras:
+            raise RuntimeError("At least one recorded camera is required for timestamp synchronization.")
+        requested_reference = self.args.sync_reference_camera
+        if requested_reference is not None and requested_reference not in self.active_cameras:
+            raise RuntimeError(
+                f"Synchronization reference camera '{requested_reference}' is not recorded by this dataset. "
+                f"Recorded cameras: {', '.join(self.active_cameras)}"
+            )
+        self.sync_reference_camera = requested_reference or (
+            "hand_left" if "hand_left" in self.active_cameras else self.active_cameras[0]
+        )
+
+    def _read_atomic_index(self) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        if not self.atomic_index_path.exists():
+            return rows
+        for line in self.atomic_index_path.read_text(encoding="utf-8").splitlines():
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(row, dict) and row.get("status") == "saved":
+                rows.append(row)
+        return rows
+
+    def _reconcile_atomic_commits(self, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Recover commits that were renamed before their index row was fsynced.
+
+        The episode directory is the source of truth: it is only moved under
+        ``episodes/`` after validation and after its manifest is durable.  A
+        crash between that rename and the JSONL append must not make a valid
+        intervention invisible to training/export tooling.
+        """
+
+        indexed_ids = {
+            str(row.get("episode_id")) for row in rows if row.get("episode_id")
+        }
+        recovered: list[dict[str, Any]] = []
+        for episode_dir in sorted(self.atomic_episode_root.iterdir()):
+            if not episode_dir.is_dir() or episode_dir.name in indexed_ids:
+                continue
+            manifest_path = episode_dir / "episode_manifest.json"
+            try:
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            except (FileNotFoundError, OSError, json.JSONDecodeError) as exc:
+                self.get_logger().error(
+                    f"committed episode has no readable manifest: {episode_dir}: {exc}"
+                )
+                continue
+            if manifest.get("status") != "saved":
+                self.get_logger().error(
+                    f"committed episode manifest is not saved: {episode_dir}"
+                )
+                continue
+            row = {
+                **manifest,
+                "path": str(episode_dir.relative_to(self.atomic_root)),
+                "index_recovered_wall_time": time.time(),
+            }
+            append_jsonl_durable(self.atomic_index_path, row)
+            recovered.append(row)
+            indexed_ids.add(episode_dir.name)
+            self.get_logger().warn(
+                f"recovered missing atomic index row for {episode_dir.name}"
+            )
+        return rows + recovered
+
+    def _recover_atomic_staging(self) -> None:
+        self.atomic_staging_root.mkdir(parents=True, exist_ok=True)
+        self.atomic_failed_root.mkdir(parents=True, exist_ok=True)
+        for staging in list(self.atomic_staging_root.iterdir()):
+            if not staging.is_dir():
+                continue
+            if (staging / "DISCARD_REQUESTED").exists():
+                shutil.rmtree(staging, ignore_errors=True)
+                continue
+            destination = self.atomic_failed_root / (
+                f"recovered-{int(time.time())}-{staging.name}"
+            )
+            os.replace(staging, destination)
+            write_json_atomic(destination / "recovery.json", {
+                "status": "interrupted",
+                "reason": "collector restarted before atomic commit",
+                "recovered_wall_time": time.time(),
+            })
+
+    def _initialize_atomic_collection(self, active: dict[str, ImageSample]) -> None:
+        self.atomic_root.mkdir(parents=True, exist_ok=True)
+        self.atomic_episode_root.mkdir(parents=True, exist_ok=True)
+        self._recover_atomic_staging()
+        self._configure_active_cameras(active)
+        rows = self._reconcile_atomic_commits(self._read_atomic_index())
+        self.saved_episodes = len(rows)
+        self.frames_written = sum(int(row.get("frames", 0)) for row in rows)
+        self.task_episode_counts.update(
+            row.get("task", self.args.task_name) for row in rows
+        )
+        next_sequence = max(
+            (int(row.get("collection_sequence", -1)) for row in rows),
+            default=-1,
+        ) + 1
+        self._atomic_next_sequence = next_sequence
+        write_json_atomic(self.atomic_root / "collection.json", {
+            "schema": "autolife-hd-dagger-atomic-v1",
+            "repo_id": self.args.repo_id,
+            "task": self.args.task_name,
+            "fps": int(self.args.fps),
+            "state_names": list(self.schema.names),
+            "action_names": list(self.schema.names),
+            "control_mode_codes": CONTROL_MODE_CODES,
+            "features": list(dataset_features(
+                active, self.schema.names, self.schema.names,
+                dagger_metadata=self.args.dagger_metadata,
+            )),
+            "updated_wall_time": time.time(),
+        })
+        self.sync_log = open(
+            self.atomic_root / "sync_log.jsonl", "a", encoding="utf-8"
+        )
+        self.started_sec = time.time()
+        self.create_timer(1.0 / float(self.args.fps), self._record_tick)
+        self.get_logger().info(
+            f"atomic episode store ready: {self.atomic_root}; "
+            f"saved episodes={self.saved_episodes}"
+        )
+        self.get_logger().info(f"active cameras: {', '.join(self.active_cameras)}")
+        self.get_logger().info(
+            f"sync reference: {self.sync_reference_camera}, "
+            f"max delta: {self.args.max_sync_delta_sec * 1000:.1f} ms"
+        )
+
+    def _create_atomic_episode_dataset(self, request_id: str | None) -> None:
+        episode_id = f"ep-{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
+        sequence = self._atomic_next_sequence
+        self._atomic_next_sequence += 1
+        staging = self.atomic_staging_root / episode_id
+        final = self.atomic_episode_root / episode_id
+        if staging.exists() or final.exists():
+            raise RuntimeError(f"atomic episode path collision: {episode_id}")
+        active = {name: self.latest_images[name] for name in self.active_cameras}
+        action_names = tuple(EEF_ACTION_NAMES) if self.args.action_mode == "eef" else self.schema.names
+        self.dataset = call_lerobot_dataset(
+            LeRobotDataset.create,
+            repo_id=f"{self.args.repo_id}-{episode_id}",
+            root=staging,
+            fps=int(self.args.fps),
+            features=dataset_features(
+                active, self.schema.names, action_names,
+                dagger_metadata=self.args.dagger_metadata,
+            ),
+            robot_type=self.args.robot_type,
+            use_videos=True,
+            image_writer_threads=self.args.image_writer_threads,
+            vcodec=self.args.vcodec,
+            rgb_encoder=make_rgb_encoder(self.args),
+            depth_encoder=make_depth_encoder(self.args),
+            batch_encoding_size=self.args.batch_encoding_size,
+            streaming_encoding=self.args.streaming_encoding,
+            encoder_queue_maxsize=self.args.encoder_queue_maxsize,
+            encoder_threads=self.args.encoder_threads,
+            video_files_size_in_mb=self.args.video_files_size_in_mb,
+            data_files_size_in_mb=self.args.data_files_size_in_mb,
+        )
+        self.active_atomic_id = episode_id
+        self.active_atomic_sequence = sequence
+        self.active_atomic_staging = staging
+        self.active_atomic_final = final
+        self.active_request_id = request_id
+        write_json_atomic(staging / "atomic_state.json", {
+            "status": "recording",
+            "schema": "autolife-hd-dagger-atomic-v1",
+            "episode_id": episode_id,
+            "collection_sequence": sequence,
+            "request_id": request_id,
+            "task": self.args.task_name,
+            "started_wall_time": time.time(),
+        })
+
     def create_dataset(self) -> None:
         active = {name: self.latest_images[name] for name in self.args.cameras if name in self.latest_images}
         if len(active) < self.args.min_cameras:
@@ -801,6 +1107,9 @@ class OfficialLeRobotRecorder(Node):
                 "No complete state packet received for the selected joint schema. "
                 "Check the state topic and WITH_HEAD/WITH_UPPER_WAIST/WITH_WAIST settings."
             )
+        if self.args.atomic_episodes:
+            self._initialize_atomic_collection(active)
+            return
         if self.args.action_mode == "status_target" and not any(
             sample.status_target_action is not None for sample in self.state_buffer
         ):
@@ -882,7 +1191,10 @@ class OfficialLeRobotRecorder(Node):
                 repo_id=self.args.repo_id,
                 root=output_dir,
                 fps=int(self.args.fps),
-                features=dataset_features(active, self.schema.names, action_names),
+                features=dataset_features(
+                    active, self.schema.names, action_names,
+                    dagger_metadata=self.args.dagger_metadata,
+                ),
                 robot_type=self.args.robot_type,
                 use_videos=True,
                 image_writer_threads=self.args.image_writer_threads,
@@ -1126,7 +1438,7 @@ class OfficialLeRobotRecorder(Node):
             and not self.episode_invalid
             and not self.has_pending_episode()
         )
-        if self.stop_requested or self.dataset is None or (
+        if self.stop_requested or (self.is_recording and self.dataset is None) or (
             not self.is_recording and not pre_roll_active
         ):
             return
@@ -1270,6 +1582,45 @@ class OfficialLeRobotRecorder(Node):
             "task": self.args.task_name,
             "observation.state": interpolated_state,
         }
+        if self.args.dagger_metadata:
+            control_sample = latest_at_or_before(
+                self.control_state_buffer, anchor_sec
+            )
+            control = (
+                control_sample.value
+                if control_sample is not None
+                else {
+                    "mode_code": 0,
+                    "authority_epoch": 0,
+                    "train_mask": 0,
+                }
+            )
+            is_pre_failure = int(not self.is_recording)
+            is_boundary = int(
+                self.is_recording
+                and self.current_episode_frames == self.active_pre_roll_frames
+            )
+            frame.update({
+                "metadata.control_mode": np.asarray(
+                    [int(control.get("mode_code", 0))], dtype=np.int64
+                ),
+                "metadata.authority_epoch": np.asarray(
+                    [int(control.get("authority_epoch", 0))], dtype=np.int64
+                ),
+                "metadata.train_mask": np.asarray(
+                    [0 if is_pre_failure else int(control.get("train_mask", 0))],
+                    dtype=np.int64,
+                ),
+                "metadata.pre_failure": np.asarray(
+                    [is_pre_failure], dtype=np.int64
+                ),
+                "metadata.failure_boundary": np.asarray(
+                    [is_boundary], dtype=np.int64
+                ),
+                "metadata.anchor_timestamp_ns": np.asarray(
+                    [int(anchor_sec * 1e9)], dtype=np.int64
+                ),
+            })
         sync_deltas_ms = {
             "state_before": (state_before.stamp_sec - anchor_sec) * 1000.0,
             "state_after": (state_after.stamp_sec - anchor_sec) * 1000.0,
@@ -1361,9 +1712,11 @@ class OfficialLeRobotRecorder(Node):
             self.last_progress_frame_count = self.session_frames_written
 
     def _log_sync(self, event: dict[str, Any]) -> None:
-        if self.sync_log is None:
-            return
-        self.sync_log.write(json.dumps(event, ensure_ascii=False) + "\n")
+        with self._sync_log_lock:
+            if self.sync_log is None:
+                return
+            self.sync_log.write(json.dumps(event, ensure_ascii=False) + "\n")
+            self.sync_log.flush()
 
     def has_pending_episode(self) -> bool:
         if self.dataset is None:
@@ -1374,6 +1727,7 @@ class OfficialLeRobotRecorder(Node):
         """Return all in-memory episode bookkeeping to the paused state."""
 
         self.current_episode_frames = 0
+        self.active_pre_roll_frames = 0
         self.is_recording = False
         self.episode_invalid = False
         self.episode_invalid_reason = None
@@ -1396,8 +1750,206 @@ class OfficialLeRobotRecorder(Node):
         if self.motion_lock_handle is not None:
             fcntl.flock(self.motion_lock_handle.fileno(), fcntl.LOCK_UN)
 
+    def _detach_atomic_episode(self) -> dict[str, Any]:
+        if (
+            self.dataset is None
+            or self.active_atomic_id is None
+            or self.active_atomic_sequence is None
+            or self.active_atomic_staging is None
+            or self.active_atomic_final is None
+        ):
+            raise RuntimeError("atomic episode state is incomplete")
+        job = {
+            "dataset": self.dataset,
+            "episode_id": self.active_atomic_id,
+            "sequence": self.active_atomic_sequence,
+            "staging": self.active_atomic_staging,
+            "final": self.active_atomic_final,
+            "start_request_id": self.active_request_id,
+        }
+        self.dataset = None
+        self.active_atomic_id = None
+        self.active_atomic_sequence = None
+        self.active_atomic_staging = None
+        self.active_atomic_final = None
+        self.active_request_id = None
+        return job
+
+    def _start_background_job(self, target: Any, *args: Any) -> None:
+        def run() -> None:
+            try:
+                target(*args)
+            finally:
+                with self._background_lock:
+                    self._background_jobs.discard(threading.current_thread())
+
+        thread = threading.Thread(
+            target=run,
+            name=f"hg-dagger-packer-{uuid.uuid4().hex[:8]}",
+            daemon=False,
+        )
+        with self._background_lock:
+            self._background_jobs.add(thread)
+        thread.start()
+
+    def _validate_atomic_episode(self, root: Path, expected_frames: int) -> dict[str, Any]:
+        import av
+        import pyarrow.parquet as pq
+
+        info_path = root / "meta" / "info.json"
+        info = json.loads(info_path.read_text(encoding="utf-8"))
+        if int(info.get("total_episodes", -1)) != 1:
+            raise RuntimeError("atomic dataset must contain exactly one episode")
+        if int(info.get("total_frames", -1)) != expected_frames:
+            raise RuntimeError(
+                f"metadata frame count {info.get('total_frames')} != {expected_frames}"
+            )
+        parquet_rows = 0
+        parquet_files = sorted((root / "data").rglob("*.parquet"))
+        if not parquet_files:
+            raise RuntimeError("atomic dataset has no Parquet data")
+        for path in parquet_files:
+            parquet_rows += pq.ParquetFile(path).metadata.num_rows
+        if parquet_rows != expected_frames:
+            raise RuntimeError(
+                f"Parquet row count {parquet_rows} != {expected_frames}"
+            )
+        video_frames: dict[str, int] = {}
+        for feature in self.active_cameras:
+            feature_dir = f"observation.images.{feature}"
+            files = sorted(
+                path for path in (root / "videos").rglob("*.mp4")
+                if feature_dir in path.parts
+            )
+            if not files:
+                raise RuntimeError(f"missing video for {feature}")
+            count = 0
+            for path in files:
+                container = av.open(str(path))
+                try:
+                    stream = container.streams.video[0]
+                    frames = int(stream.frames or 0)
+                    if frames <= 0:
+                        frames = sum(1 for _ in container.decode(stream))
+                    count += frames
+                finally:
+                    container.close()
+            if count != expected_frames:
+                raise RuntimeError(
+                    f"video frame count for {feature} is {count}, expected {expected_frames}"
+                )
+            video_frames[feature] = count
+        return {
+            "parquet_rows": parquet_rows,
+            "video_frames": video_frames,
+            "validated_wall_time": time.time(),
+        }
+
+    def _atomic_save_worker(
+        self, job: dict[str, Any], episode_frames: int,
+        reason: str, request_id: str | None,
+    ) -> None:
+        dataset = job["dataset"]
+        staging = Path(job["staging"])
+        final = Path(job["final"])
+        sequence = int(job["sequence"])
+        episode_id = str(job["episode_id"])
+        try:
+            dataset.save_episode()
+            dataset.finalize()
+            validation = self._validate_atomic_episode(staging, episode_frames)
+            manifest = {
+                "schema": "autolife-hd-dagger-atomic-v1",
+                "status": "saved",
+                "episode_id": episode_id,
+                "collection_sequence": sequence,
+                "start_request_id": job.get("start_request_id"),
+                "save_request_id": request_id,
+                "task": self.args.task_name,
+                "frames": episode_frames,
+                "fps": int(self.args.fps),
+                "reason": reason,
+                "control_mode_codes": CONTROL_MODE_CODES,
+                "validation": validation,
+                "finished_wall_time": time.time(),
+            }
+            write_json_atomic(staging / "episode_manifest.json", manifest)
+            if final.exists():
+                raise RuntimeError(f"atomic destination already exists: {final}")
+            os.replace(staging, final)
+            fsync_directory(self.atomic_episode_root)
+            index_row = {
+                **manifest,
+                "path": str(final.relative_to(self.atomic_root)),
+            }
+            with self._index_lock:
+                append_jsonl_durable(self.atomic_index_path, index_row)
+                self.saved_episodes += 1
+                self.task_episode_counts[self.args.task_name] += 1
+                self.session_saved_by_task[self.args.task_name] += 1
+            self._log_sync({
+                "event": "episode_saved",
+                "episode_index": sequence,
+                "episode_id": episode_id,
+                "frames": episode_frames,
+                "reason": reason,
+                "total_saved_episodes": self.saved_episodes,
+                "wall_time": time.time(),
+            })
+            self._write_command_status(
+                "save", True, request_id,
+                episode_index=sequence,
+                frames=episode_frames,
+                message=f"atomic episode saved and validated: {episode_id}",
+            )
+        except Exception as exc:
+            try:
+                dataset.finalize()
+            except Exception:
+                pass
+            failed = self.atomic_failed_root / f"{episode_id}-{int(time.time())}"
+            try:
+                if staging.exists():
+                    os.replace(staging, failed)
+                    write_json_atomic(failed / "failure.json", {
+                        "status": "failed",
+                        "episode_id": episode_id,
+                        "collection_sequence": sequence,
+                        "request_id": request_id,
+                        "error": str(exc),
+                        "wall_time": time.time(),
+                    })
+            except Exception as move_exc:
+                self.get_logger().error(
+                    f"could not quarantine failed atomic episode: {move_exc}"
+                )
+            self.get_logger().error(f"atomic save failed for {episode_id}: {exc}")
+            self._write_command_status(
+                "save", False, request_id,
+                episode_index=sequence,
+                frames=episode_frames,
+                message=f"atomic save failed: {exc}",
+            )
+
+    def _atomic_discard_worker(self, job: dict[str, Any]) -> None:
+        dataset = job["dataset"]
+        staging = Path(job["staging"])
+        try:
+            if dataset.has_pending_frames():
+                dataset.clear_episode_buffer(delete_images=True)
+            dataset.finalize()
+        except Exception as exc:
+            self.get_logger().error(
+                f"atomic discard drain failed for {job['episode_id']}: {exc}"
+            )
+        shutil.rmtree(staging, ignore_errors=True)
+        if staging.exists():
+            self.get_logger().error(
+                f"atomic discard left residual staging data: {staging}"
+            )
+
     def start_episode(self, reason: str, request_id: str | None = None) -> bool:
-        if self.dataset is None:
+        if self.dataset is None and not self.args.atomic_episodes:
             self.get_logger().warn("dataset is not ready yet")
             self._write_command_status(
                 "start", False, request_id, message="dataset is not ready yet"
@@ -1428,7 +1980,21 @@ class OfficialLeRobotRecorder(Node):
                 "start", False, request_id, message="robot motion lock is busy"
             )
             return False
-        episode_index = self.saved_episodes
+        if self.args.atomic_episodes:
+            try:
+                self._create_atomic_episode_dataset(request_id)
+            except Exception as exc:
+                self._release_motion_lock()
+                self._write_command_status(
+                    "start", False, request_id,
+                    message=f"failed to create atomic episode staging: {exc}",
+                )
+                return False
+        episode_index = (
+            int(self.active_atomic_sequence)
+            if self.args.atomic_episodes and self.active_atomic_sequence is not None
+            else self.saved_episodes
+        )
         prefix = list(self.pre_roll_frames)
         self._reset_episode_state()
         try:
@@ -1439,6 +2005,14 @@ class OfficialLeRobotRecorder(Node):
                 self.dataset.clear_episode_buffer(delete_images=True)
             except Exception:
                 pass
+            if self.args.atomic_episodes and self.dataset is not None:
+                job = self._detach_atomic_episode()
+                staging = Path(job["staging"])
+                try:
+                    job["dataset"].finalize()
+                except Exception:
+                    pass
+                shutil.rmtree(staging, ignore_errors=True)
             self._release_motion_lock()
             self._write_command_status(
                 "start", False, request_id,
@@ -1447,6 +2021,7 @@ class OfficialLeRobotRecorder(Node):
             return False
         self.pre_roll_frames.clear()
         self.current_episode_frames = len(prefix)
+        self.active_pre_roll_frames = len(prefix)
         self.frames_written += len(prefix)
         self.session_frames_written += len(prefix)
         self.is_recording = True
@@ -1497,6 +2072,29 @@ class OfficialLeRobotRecorder(Node):
             return False
         episode_index = self.saved_episodes
         episode_frames = self.current_episode_frames
+        if self.args.atomic_episodes:
+            job = self._detach_atomic_episode()
+            episode_index = int(job["sequence"])
+            episode_id = str(job["episode_id"])
+            self._reset_episode_state()
+            self._release_motion_lock()
+            self._log_sync({
+                "event": "episode_pack_started",
+                "episode_index": episode_index,
+                "episode_id": episode_id,
+                "frames": episode_frames,
+                "reason": reason,
+                "wall_time": time.time(),
+            })
+            self._start_background_job(
+                self._atomic_save_worker,
+                job, episode_frames, reason, request_id,
+            )
+            self.get_logger().info(
+                f"atomic episode {episode_id} detached with {episode_frames} "
+                "frame(s); validation/encoding continues in background"
+            )
+            return True
         self.get_logger().info(
             f"saving episode {episode_index} with {episode_frames} frame(s) ({reason})"
         )
@@ -1558,6 +2156,42 @@ class OfficialLeRobotRecorder(Node):
         self.get_logger().warn(
             f"discarding current episode buffer with {discarded_frames} frame(s) ({reason})"
         )
+        if self.args.atomic_episodes and self.dataset is not None:
+            job = self._detach_atomic_episode()
+            staging = Path(job["staging"])
+            write_json_atomic(staging / "DISCARD_REQUESTED", {
+                "episode_id": job["episode_id"],
+                "collection_sequence": job["sequence"],
+                "request_id": request_id,
+                "reason": reason,
+                "wall_time": time.time(),
+            })
+            self.frames_written -= discarded_frames
+            self.session_frames_written -= discarded_frames
+            self.discarded_episodes += 1
+            self.session_discarded_by_task[self.args.task_name] += 1
+            self._log_sync({
+                "event": "episode_discarded",
+                "episode_id": job["episode_id"],
+                "collection_sequence": job["sequence"],
+                "reason": reason,
+                "invalid_reason": invalid_reason,
+                "discarded_frames": discarded_frames,
+                "total_discarded_episodes": self.discarded_episodes,
+                "wall_time": time.time(),
+            })
+            self._reset_episode_state()
+            self._release_motion_lock()
+            self._write_command_status(
+                "discard", True, request_id,
+                episode_index=int(job["sequence"]),
+                frames=discarded_frames,
+                message=(
+                    f"atomic episode isolated for discard: {job['episode_id']}"
+                ),
+            )
+            self._start_background_job(self._atomic_discard_worker, job)
+            return True
         if has_buffered_frames:
             try:
                 self.dataset.clear_episode_buffer(delete_images=True)
@@ -1632,10 +2266,18 @@ class OfficialLeRobotRecorder(Node):
                 self.save_current_episode("shutdown")
         if self.dataset is not None:
             self.dataset.finalize()
-        if self.sync_log is not None:
-            self.sync_log.flush()
-            self.sync_log.close()
-            self.sync_log = None
+        while True:
+            with self._background_lock:
+                jobs = list(self._background_jobs)
+            if not jobs:
+                break
+            for job in jobs:
+                job.join()
+        with self._sync_log_lock:
+            if self.sync_log is not None:
+                self.sync_log.flush()
+                self.sync_log.close()
+                self.sync_log = None
         self._release_motion_lock()
         if self.motion_lock_handle is not None:
             self.motion_lock_handle.close()
@@ -1683,6 +2325,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-dir", type=Path, required=True,
         help="Root directory of the LeRobotDataset. Existing metadata and episodes are resumed.",
+    )
+    parser.add_argument(
+        "--atomic-episodes",
+        action="store_true",
+        help=(
+            "Write each intervention into an isolated staging LeRobot dataset, "
+            "validate it, then atomically commit it under episodes/. This is "
+            "the required crash-safe mode for HG-DAGGER collection."
+        ),
+    )
+    parser.add_argument(
+        "--dagger-metadata",
+        action="store_true",
+        help=(
+            "Add per-frame control-mode, authority, train-mask, pre-failure, "
+            "failure-boundary, and anchor-timestamp features."
+        ),
     )
     parser.add_argument(
         "--repo-id", default=None,
@@ -1832,6 +2491,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--state-topic", default=STATE_TOPIC,
         help="ROS2 JSON-string topic carrying the complete physical joint status packet.",
+    )
+    parser.add_argument(
+        "--control-state-topic",
+        default="/hg_dagger/control_state",
+        help="HG-DAGGER JSON control-state topic used for authority/train-mask metadata.",
     )
     parser.add_argument(
         "--action-mode",
