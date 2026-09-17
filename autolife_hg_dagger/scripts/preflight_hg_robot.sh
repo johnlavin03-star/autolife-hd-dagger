@@ -40,7 +40,7 @@ else
   fail "no live joint feedback on ${joint_topic} (do not enable hardware)"
 fi
 
-conflict_pattern='openarmx_teleop_vr_navigation_306.*full_vr_navigation.launch.py|openarmx_teleop_vr_306_v4.controller_node|openarmx_306_v4_mapper|hg_dagger_supervisor|openarmx_teleop_vr_306_v4.vr_web_bridge'
+conflict_pattern='openarmx_teleop_vr_navigation_306.*full_vr_navigation.launch.py|openarmx_teleop_vr_306_v4.controller_node|openarmx_306_v4_mapper|hg_dagger_supervisor|openarmx_teleop_vr_306_v4.vr_web_bridge|control_center_joint_control.*whole_body_joint_control.launch.py|whole_body_joint_bridge'
 conflicts="$(pgrep -af "$conflict_pattern" || true)"
 if [ -n "$conflicts" ]; then
   fail "another VR/HG control stack is running:"
