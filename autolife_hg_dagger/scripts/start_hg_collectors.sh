@@ -147,6 +147,7 @@ start_one() {
     --repo-id "local/${task_name}_hg_dagger_${variant}"
     --task-name "${task_text}"
     --motion-lock-file "/tmp/lerobot_robot_${topic_suffix}.motion.lock"
+    --min-free-disk-gb "${HG_DAGGER_MIN_FREE_DISK_GB:-5.0}"
     --fps "${dataset_fps}"
     --image-source shm
     --image-poll-fps 120
@@ -172,6 +173,12 @@ start_one() {
   )
   if [ "${with_depth}" = "1" ]; then
     args+=(--with-depth)
+  fi
+  if [ "${HG_DAGGER_TEST_CAMERA_DESYNC_AFTER_FRAMES:-0}" -gt 0 ]; then
+    args+=(--test-inject-camera-desync-after-frames "${HG_DAGGER_TEST_CAMERA_DESYNC_AFTER_FRAMES}")
+  fi
+  if [ "${HG_DAGGER_TEST_ENOSPC_ON_SAVE:-0}" = "1" ]; then
+    args+=(--test-inject-enospc-on-save-once)
   fi
 
   nohup env \

@@ -25,6 +25,7 @@ tolerance.
 from __future__ import annotations
 
 import argparse
+import errno
 import fcntl
 import inspect
 import json
@@ -400,6 +401,9 @@ class OfficialLeRobotRecorder(Node):
         self._background_lock = threading.Lock()
         self._index_lock = threading.Lock()
         self._sync_log_lock = threading.Lock()
+        self._test_fault_lock = threading.Lock()
+        self._test_camera_desync_injected = False
+        self._test_enospc_injected = False
         self.active_cameras: list[str] = []
         self.channel_first_cameras: set[str] = set()
         self.stop_requested = False
@@ -1045,6 +1049,7 @@ class OfficialLeRobotRecorder(Node):
         )
 
     def _create_atomic_episode_dataset(self, request_id: str | None) -> None:
+        self._require_free_disk("episode start")
         episode_id = f"ep-{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
         sequence = self._atomic_next_sequence
         self._atomic_next_sequence += 1
@@ -1090,6 +1095,26 @@ class OfficialLeRobotRecorder(Node):
             "task": self.args.task_name,
             "started_wall_time": time.time(),
         })
+
+    def _require_free_disk(self, operation: str) -> None:
+        minimum = float(self.args.min_free_disk_gb) * (1024 ** 3)
+        free = shutil.disk_usage(self.atomic_root).free
+        if free < minimum:
+            raise OSError(
+                errno.ENOSPC,
+                f"insufficient free disk for {operation}: "
+                f"{free / (1024 ** 3):.2f} GiB available, "
+                f"{self.args.min_free_disk_gb:.2f} GiB required",
+            )
+
+    def _consume_test_enospc(self) -> bool:
+        if not self.args.test_inject_enospc_on_save_once:
+            return False
+        with self._test_fault_lock:
+            if self._test_enospc_injected:
+                return False
+            self._test_enospc_injected = True
+            return True
 
     def create_dataset(self) -> None:
         active = {name: self.latest_images[name] for name in self.args.cameras if name in self.latest_images}
@@ -1671,6 +1696,20 @@ class OfficialLeRobotRecorder(Node):
         sync_deltas_ms.update(action_deltas_ms)
         receive_ages_ms.update(action_ages_ms)
 
+        live_frames = self.current_episode_frames - self.active_pre_roll_frames
+        if (
+            self.is_recording
+            and self.args.test_inject_camera_desync_after_frames > 0
+            and not self._test_camera_desync_injected
+            and live_frames >= self.args.test_inject_camera_desync_after_frames
+        ):
+            self._test_camera_desync_injected = True
+            self._invalidate_episode(
+                "test_injected_camera_desync",
+                now,
+                live_frames=live_frames,
+            )
+            return
         if self.is_recording:
             self.dataset.add_frame(frame)
         else:
@@ -1855,6 +1894,12 @@ class OfficialLeRobotRecorder(Node):
         sequence = int(job["sequence"])
         episode_id = str(job["episode_id"])
         try:
+            self._require_free_disk("episode save")
+            if self._consume_test_enospc():
+                raise OSError(
+                    errno.ENOSPC,
+                    "test-injected ENOSPC before atomic episode save",
+                )
             dataset.save_episode()
             dataset.finalize()
             validation = self._validate_atomic_episode(staging, episode_frames)
@@ -1903,26 +1948,32 @@ class OfficialLeRobotRecorder(Node):
                 message=f"atomic episode saved and validated: {episode_id}",
             )
         except Exception as exc:
+            is_enospc = isinstance(exc, OSError) and exc.errno == errno.ENOSPC
             try:
+                if is_enospc and dataset.has_pending_frames():
+                    dataset.clear_episode_buffer(delete_images=True)
                 dataset.finalize()
             except Exception:
                 pass
-            failed = self.atomic_failed_root / f"{episode_id}-{int(time.time())}"
-            try:
-                if staging.exists():
-                    os.replace(staging, failed)
-                    write_json_atomic(failed / "failure.json", {
-                        "status": "failed",
-                        "episode_id": episode_id,
-                        "collection_sequence": sequence,
-                        "request_id": request_id,
-                        "error": str(exc),
-                        "wall_time": time.time(),
-                    })
-            except Exception as move_exc:
-                self.get_logger().error(
-                    f"could not quarantine failed atomic episode: {move_exc}"
-                )
+            if is_enospc:
+                shutil.rmtree(staging, ignore_errors=True)
+            else:
+                failed = self.atomic_failed_root / f"{episode_id}-{int(time.time())}"
+                try:
+                    if staging.exists():
+                        os.replace(staging, failed)
+                        write_json_atomic(failed / "failure.json", {
+                            "status": "failed",
+                            "episode_id": episode_id,
+                            "collection_sequence": sequence,
+                            "request_id": request_id,
+                            "error": str(exc),
+                            "wall_time": time.time(),
+                        })
+                except Exception as move_exc:
+                    self.get_logger().error(
+                        f"could not quarantine failed atomic episode: {move_exc}"
+                    )
             self.get_logger().error(f"atomic save failed for {episode_id}: {exc}")
             self._write_command_status(
                 "save", False, request_id,
@@ -2354,6 +2405,23 @@ def parse_args() -> argparse.Namespace:
         help="Advisory flock held only while an episode is actively recording.",
     )
     parser.add_argument(
+        "--min-free-disk-gb",
+        type=float,
+        default=5.0,
+        help="Fail closed before episode start/save when free space is below this threshold.",
+    )
+    parser.add_argument(
+        "--test-inject-camera-desync-after-frames",
+        type=int,
+        default=0,
+        help="TEST ONLY: invalidate one active episode after this many live frames; 0 disables.",
+    )
+    parser.add_argument(
+        "--test-inject-enospc-on-save-once",
+        action="store_true",
+        help="TEST ONLY: inject one ENOSPC failure before atomic save and verify cleanup.",
+    )
+    parser.add_argument(
         "--task-name", default="mango_pick",
         help="Natural-language task instruction written into every frame, for example 'pick up the bottle'.",
     )
@@ -2551,6 +2619,10 @@ def parse_args() -> argparse.Namespace:
         parser.error("--fps and --min-cameras must be positive")
     if args.pre_roll_sec < 0:
         parser.error("--pre-roll-sec must be non-negative")
+    if args.min_free_disk_gb < 0:
+        parser.error("--min-free-disk-gb must be non-negative")
+    if args.test_inject_camera_desync_after_frames < 0:
+        parser.error("--test-inject-camera-desync-after-frames must be non-negative")
     if args.state_warmup_sec <= 0 or args.camera_warmup_sec <= 0:
         parser.error("state and camera warmup timeouts must be positive")
     if (

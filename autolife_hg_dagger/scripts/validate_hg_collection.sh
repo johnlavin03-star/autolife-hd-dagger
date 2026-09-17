@@ -29,4 +29,9 @@ if [ ! -d "${dataset_root}" ]; then
   exit 3
 fi
 
-exec "${lerobot_py}" "${script_dir}/validate_hg_atomic_dataset.py" "${dataset_root}"
+validator_args=()
+if [ -n "${HG_DAGGER_EXPECT_SAVED_EPISODES:-}" ]; then
+  validator_args+=(--expect-episodes "${HG_DAGGER_EXPECT_SAVED_EPISODES}")
+fi
+exec "${lerobot_py}" "${script_dir}/validate_hg_atomic_dataset.py" \
+  "${validator_args[@]}" "${dataset_root}"

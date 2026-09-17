@@ -18,6 +18,12 @@ REQUIRED_DAGGER_COLUMNS = {
     "metadata.failure_boundary",
     "metadata.anchor_timestamp_ns",
 }
+REQUIRED_RGBD_CAMERAS = {
+    "rgbd_head_color",
+    "rgbd_head_depth",
+    "hand_left",
+    "hand_right",
+}
 
 
 def load_json(path: Path) -> dict[str, Any]:
@@ -70,6 +76,7 @@ def audit_episode(root: Path, row: dict[str, Any]) -> tuple[list[str], dict[str,
         return [f"{episode_id}: invalid episode manifest: {exc}"], details
     if manifest.get("status") != "saved":
         errors.append(f"{episode_id}: manifest status is not saved")
+    details["manifest_saved"] = manifest.get("status") == "saved"
     if str(manifest.get("episode_id")) != episode_id:
         errors.append(f"{episode_id}: manifest episode_id mismatch")
     if int(manifest.get("frames", -1)) != expected:
@@ -78,11 +85,20 @@ def audit_episode(root: Path, row: dict[str, Any]) -> tuple[list[str], dict[str,
     parquet_files = sorted((episode / "data").rglob("*.parquet"))
     parquet_rows = 0
     columns: set[str] = set()
+    parquet_episode_indices: set[int] = set()
     for parquet in parquet_files:
         try:
             metadata = pq.ParquetFile(parquet).metadata
             parquet_rows += metadata.num_rows
-            columns.update(pq.read_schema(parquet).names)
+            schema_names = pq.read_schema(parquet).names
+            columns.update(schema_names)
+            if "episode_index" in schema_names:
+                parquet_episode_indices.update(
+                    int(value)
+                    for value in pq.read_table(
+                        parquet, columns=["episode_index"]
+                    ).column("episode_index").to_pylist()
+                )
         except Exception as exc:
             errors.append(f"{episode_id}: unreadable Parquet {parquet.name}: {exc}")
     if not parquet_files:
@@ -91,6 +107,11 @@ def audit_episode(root: Path, row: dict[str, Any]) -> tuple[list[str], dict[str,
         errors.append(
             f"{episode_id}: Parquet rows={parquet_rows}, expected={expected}"
         )
+    if parquet_episode_indices != {0}:
+        errors.append(
+            f"{episode_id}: Parquet episode_index values are "
+            f"{sorted(parquet_episode_indices)}, expected [0]"
+        )
     missing_columns = sorted(REQUIRED_DAGGER_COLUMNS - columns)
     if missing_columns:
         errors.append(
@@ -98,9 +119,11 @@ def audit_episode(root: Path, row: dict[str, Any]) -> tuple[list[str], dict[str,
         )
 
     info_path = episode / "meta" / "info.json"
+    lerobot_episode_count = 0
     try:
         info = load_json(info_path)
-        if int(info.get("total_episodes", -1)) != 1:
+        lerobot_episode_count = int(info.get("total_episodes", -1))
+        if lerobot_episode_count != 1:
             errors.append(f"{episode_id}: total_episodes is not 1")
         if int(info.get("total_frames", -1)) != expected:
             errors.append(f"{episode_id}: info.json frame count mismatch")
@@ -109,6 +132,13 @@ def audit_episode(root: Path, row: dict[str, Any]) -> tuple[list[str], dict[str,
             for key in info.get("features", {})
             if key.startswith("observation.images.")
         )
+        missing_cameras = sorted(REQUIRED_RGBD_CAMERAS - set(camera_keys))
+        extra_cameras = sorted(set(camera_keys) - REQUIRED_RGBD_CAMERAS)
+        if missing_cameras or extra_cameras:
+            errors.append(
+                f"{episode_id}: camera schema mismatch; "
+                f"missing={missing_cameras}, extra={extra_cameras}"
+            )
     except Exception as exc:
         errors.append(f"{episode_id}: invalid info.json: {exc}")
         camera_keys = []
@@ -136,6 +166,8 @@ def audit_episode(root: Path, row: dict[str, Any]) -> tuple[list[str], dict[str,
     details.update(
         frames=expected,
         parquet_rows=parquet_rows,
+        parquet_episode_indices=sorted(parquet_episode_indices),
+        lerobot_episode_count=lerobot_episode_count,
         video_frames=video_counts,
         metadata_columns=sorted(REQUIRED_DAGGER_COLUMNS & columns),
     )
@@ -151,6 +183,12 @@ def main() -> int:
         help="Do not fail merely because .staging contains an active episode.",
     )
     parser.add_argument("--json", action="store_true", help="Emit a JSON report.")
+    parser.add_argument(
+        "--expect-episodes",
+        type=int,
+        default=None,
+        help="Require exactly this many committed/saved episodes.",
+    )
     args = parser.parse_args()
     root = args.dataset_root.expanduser().resolve()
     errors: list[str] = []
@@ -190,10 +228,74 @@ def main() -> int:
     if staging and not args.allow_active_staging:
         errors.append(f"uncommitted staging directories remain: {', '.join(staging)}")
 
+    failed_dirs = [
+        path for path in (root / ".failed").iterdir() if path.is_dir()
+    ] if (root / ".failed").is_dir() else []
+    for failed in failed_dirs:
+        if not (failed / "failure.json").exists() and not (failed / "recovery.json").exists():
+            errors.append(f"unlabelled failed/quarantine directory: {failed.name}")
+
+    raw_images = sorted(
+        path for path in root.rglob("*")
+        if path.is_file()
+        and path.suffix.lower() in {".png", ".jpg", ".jpeg", ".bmp"}
+        and ".failed" not in path.parts
+        and ".staging" not in path.parts
+    )
+    if raw_images:
+        errors.append(
+            f"orphan/unencoded raw image files remain outside quarantine: {len(raw_images)}"
+        )
+
     for row in rows:
         episode_errors, episode_details = audit_episode(root, row)
         errors.extend(episode_errors)
         details.append(episode_details)
+
+    sidecar_root = root.parent.parent / "hg_dagger_sidecar"
+    sidecar_manifests: list[dict[str, Any]] = []
+    for path in sidecar_root.glob("session-*/interventions/*/manifest.json"):
+        try:
+            sidecar_manifests.append(load_json(path))
+        except Exception as exc:
+            errors.append(f"invalid sidecar manifest {path}: {exc}")
+    sidecar_saved_count = sum(
+        1 for manifest in sidecar_manifests if manifest.get("status") == "saved"
+    )
+    manifest_saved_count = sum(
+        int(detail.get("manifest_saved", False)) for detail in details
+    )
+    lerobot_episode_count = sum(
+        int(detail.get("lerobot_episode_count", 0)) for detail in details
+    )
+    parquet_episode_index_count = sum(
+        len(detail.get("parquet_episode_indices", [])) for detail in details
+    )
+    video_episode_counts = {
+        camera: sum(
+            1 for detail in details
+            if camera in detail.get("video_frames", {})
+            and detail["video_frames"][camera] == detail.get("frames")
+        )
+        for camera in sorted(REQUIRED_RGBD_CAMERAS)
+    }
+    expected_count = len(rows)
+    count_values = {
+        "atomic_manifest_saved": manifest_saved_count,
+        "sidecar_manifest_saved": sidecar_saved_count,
+        "lerobot": lerobot_episode_count,
+        "parquet_episode_index": parquet_episode_index_count,
+        **{f"video:{key}": value for key, value in video_episode_counts.items()},
+    }
+    for label, value in count_values.items():
+        if value != expected_count:
+            errors.append(
+                f"count mismatch: {label}={value}, episode_index={expected_count}"
+            )
+    if args.expect_episodes is not None and expected_count != args.expect_episodes:
+        errors.append(
+            f"expected {args.expect_episodes} committed episodes, found {expected_count}"
+        )
 
     report = {
         "success": not errors,
@@ -201,6 +303,13 @@ def main() -> int:
         "episodes": len(rows),
         "frames": sum(max(0, int(row.get("frames", 0))) for row in rows),
         "active_staging": staging,
+        "quarantined_failed_episodes": len(failed_dirs),
+        "orphan_raw_images": len(raw_images),
+        "manifest_saved_count": manifest_saved_count,
+        "sidecar_manifest_saved_count": sidecar_saved_count,
+        "lerobot_episode_count": lerobot_episode_count,
+        "parquet_episode_index_count": parquet_episode_index_count,
+        "video_episode_counts": video_episode_counts,
         "errors": errors,
         "details": details,
     }
@@ -210,6 +319,15 @@ def main() -> int:
         print(
             f"{'PASS' if not errors else 'FAIL'}  episodes={report['episodes']} "
             f"frames={report['frames']} root={root}"
+        )
+        print(
+            "COUNTS "
+            f"atomic_manifest_saved={report['manifest_saved_count']} "
+            f"sidecar_manifest_saved={report['sidecar_manifest_saved_count']} "
+            f"lerobot={report['lerobot_episode_count']} "
+            f"parquet_episode_index={report['parquet_episode_index_count']} "
+            f"videos={report['video_episode_counts']} "
+            f"staging={len(staging)} orphan_images={len(raw_images)}"
         )
         for error in errors:
             print(f"ERROR {error}")
