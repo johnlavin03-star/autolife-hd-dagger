@@ -177,12 +177,12 @@ collector 在等待失败期间维护同步 RGBD 环形缓存；接管 `start` �
 pre-roll/HOLD 动作当成 expert label。上一条 episode 后台编码时，同一
 会话仍可立即开始新接管；只有关闭后立即重新启用会话时会等待全部落盘。
 
-停止采集器后，用 LeRobot 环境做完整性审计：
+停止采集器后，按真实任务名做完整性审计（不要输入
+`<TASK_NAME>` 这种带尖括号的文档占位符）：
 
 ```bash
-/home/ubuntu/miniconda3/envs/lerobot/bin/python \
-  /home/ubuntu/ros2_ws/src/autolife-hd-dagger/autolife_hg_dagger/scripts/validate_hg_atomic_dataset.py \
-  /home/ubuntu/hg_dagger_data_300/hd300_vla_vr_01/hg_dagger_rgbd/atomic_dataset_v1
+bash /home/ubuntu/ros2_ws/src/autolife-hd-dagger/autolife_hg_dagger/scripts/validate_hg_collection.sh \
+  hd300_vla_vr_01 /home/ubuntu/hg_dagger_data_300
 ```
 
 只有输出 `PASS` 且 `.staging` 为空，才把该批数据交给后续导出器。
