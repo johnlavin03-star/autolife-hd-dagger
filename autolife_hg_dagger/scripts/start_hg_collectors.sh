@@ -4,7 +4,13 @@ set -euo pipefail
 task_name="${1:-}"
 task_text="${2:-${task_name}}"
 data_root="${3:-${HG_DAGGER_DATA_ROOT:-/home/ubuntu/hg_dagger_data}}"
-collector_root="${HG_DAGGER_COLLECTOR_ROOT:-/home/ubuntu/lerobot_data_collector}"
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+repo_root="$(cd -- "${script_dir}/../.." && pwd)"
+# Existing/official collector checkout supplies shared helper modules only.  The
+# HG-DAGGER recorder itself is repository-local so this script never overwrites
+# or changes the existing data-collection implementation.
+collector_runtime_root="${HG_DAGGER_COLLECTOR_ROOT:-/home/ubuntu/lerobot_data_collector}"
+recorder="${HG_DAGGER_RECORDER:-${repo_root}/lerobot_data_collector/record_lerobot_official.py}"
 lerobot_py="${LEROBOT_PY:-/home/ubuntu/miniconda3/envs/lerobot/bin/python}"
 robot_py="${ROBOT_ENV_PY:-/home/ubuntu/miniconda3/envs/robot_env/bin/python}"
 robot_id="${HG_DAGGER_ROBOT_ID:-${ROBOT_ID:-328}}"
@@ -31,10 +37,11 @@ if [ ! -x "${lerobot_py}" ]; then
   echo "ERROR: LeRobot Python is unavailable: ${lerobot_py}" >&2
   exit 4
 fi
-recorder="${collector_root}/record_lerobot_official.py"
-control="${collector_root}/collector_control.py"
+control="${collector_runtime_root}/collector_control.py"
 if [ ! -f "${recorder}" ] || [ ! -f "${control}" ]; then
-  echo "ERROR: collector checkout is incomplete: ${collector_root}" >&2
+  echo "ERROR: isolated recorder or collector runtime is incomplete" >&2
+  echo "  HG recorder: ${recorder}" >&2
+  echo "  runtime helper: ${control}" >&2
   exit 5
 fi
 
@@ -54,7 +61,7 @@ start_hand_producer() {
   local session_dir="${data_root}/${task_name}/hg_dagger_rgbd"
   local log_dir="${session_dir}/logs"
   local pid_file="${session_dir}/.hg_dagger_hand_producer.pid"
-  local producer="${collector_root}/hand_camera_producer.py"
+  local producer="${collector_runtime_root}/hand_camera_producer.py"
 
   mkdir -p "${session_dir}" "${log_dir}"
   if [ -f "${pid_file}" ]; then
@@ -83,7 +90,7 @@ start_hand_producer() {
   local log_file="${log_dir}/hg_dagger_hand_camera_$(date +%Y%m%d_%H%M%S).log"
   nohup env \
     LD_LIBRARY_PATH="${robot_env_lib}:${ros_ld_library_path}" \
-    PYTHONPATH="${collector_root}:${ros_pythonpath}" \
+    PYTHONPATH="${collector_runtime_root}:${ros_pythonpath}" \
     HAND_LEFT_CAMERA_DEVICE="${HG_DAGGER_HAND_LEFT_DEVICE:-/dev/video12}" \
     HAND_RIGHT_CAMERA_DEVICE="${HG_DAGGER_HAND_RIGHT_DEVICE:-/dev/video10}" \
     "${robot_py}" "${producer}" >"${log_file}" 2>&1 &
@@ -114,8 +121,7 @@ start_one() {
   local dataset_fps="${HG_DAGGER_DATASET_FPS:-${default_dataset_fps}}"
 
   if ! grep -q "HG-DAGGER atomic episode store" "${recorder}"; then
-    echo "ERROR: HG-DAGGER atomic collector is not installed: ${recorder}" >&2
-    echo "Run autolife_hg_dagger/scripts/setup_hg_collector_env.sh first." >&2
+    echo "ERROR: repository-local HG-DAGGER atomic recorder is invalid: ${recorder}" >&2
     return 1
   fi
 
@@ -174,7 +180,7 @@ start_one() {
     RMW_IMPLEMENTATION=rmw_cyclonedds_cpp \
     CYCLONEDDS_URI="${cyclonedds_uri}" \
     LD_LIBRARY_PATH="${lerobot_env_lib}:${ros_ld_library_path}" \
-    PYTHONPATH="${ros_pythonpath}" \
+    PYTHONPATH="${collector_runtime_root}:${ros_pythonpath}" \
     "${lerobot_py}" "${args[@]}" >"${log_file}" 2>&1 &
   local recorder_pid=$!
   echo "${recorder_pid}" > "${pid_file}"

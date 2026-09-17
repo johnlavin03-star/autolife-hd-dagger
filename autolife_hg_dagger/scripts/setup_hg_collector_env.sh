@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
-# Install the repository-pinned crash-safe collector required by HG-DAGGER.
+# Validate the isolated repository-pinned collector required by HG-DAGGER.
 
 set -euo pipefail
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 collector_root="${HG_DAGGER_COLLECTOR_ROOT:-/home/ubuntu/lerobot_data_collector}"
-target="${collector_root}/record_lerobot_official.py"
 source_file="${script_dir}/../../lerobot_data_collector/record_lerobot_official.py"
+lerobot_py="${LEROBOT_PY:-/home/ubuntu/miniconda3/envs/lerobot/bin/python}"
 
-if [ ! -f "${target}" ]; then
-  echo "ERROR: collector recorder not found: ${target}" >&2
+if [ ! -f "${collector_root}/collector_control.py" ]; then
+  echo "ERROR: existing collector runtime not found: ${collector_root}" >&2
   exit 2
 fi
 if [ ! -f "${source_file}" ]; then
@@ -17,14 +17,11 @@ if [ ! -f "${source_file}" ]; then
   exit 3
 fi
 
-if cmp -s "${source_file}" "${target}"; then
-  echo "HG-DAGGER atomic collector is already installed."
-else
-  backup="${target}.pre_atomic_$(date +%Y%m%d_%H%M%S)"
-  cp "${target}" "${backup}"
-  install -m 0644 "${source_file}" "${target}"
-  echo "Installed repository-pinned HG-DAGGER atomic collector; backup: ${backup}"
+if [ ! -x "${lerobot_py}" ]; then
+  echo "ERROR: LeRobot Python is unavailable: ${lerobot_py}" >&2
+  exit 4
 fi
 
-python3 -m py_compile "${target}"
-echo "HG-DAGGER collector environment is ready."
+"${lerobot_py}" -m py_compile "${source_file}"
+echo "HG-DAGGER isolated collector is ready: ${source_file}"
+echo "Existing collector remains untouched: ${collector_root}/record_lerobot_official.py"

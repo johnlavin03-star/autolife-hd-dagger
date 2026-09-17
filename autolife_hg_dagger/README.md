@@ -160,8 +160,12 @@ collector：
 bash /home/ubuntu/ros2_ws/src/autolife-hd-dagger/autolife_hg_dagger/scripts/setup_hg_collector_env.sh
 ```
 
-安装脚本会先备份机器人上的旧 recorder，再复制仓库版本并执行
-`py_compile`。wrapper 会 fail-closed：不是 atomic 版 collector 就拒绝启动。
+该脚本只校验仓库内的独立 recorder 和 LeRobot 运行环境，不会复制、
+覆盖或修改 `/home/ubuntu/lerobot_data_collector/record_lerobot_official.py`。
+HD-DAGGER 仅从旧 collector 目录导入共享的相机/时序工具和 control helper，
+实际启动的 recorder 固定为本仓库
+`lerobot_data_collector/record_lerobot_official.py`。wrapper 会 fail-closed：
+仓库 recorder 不是 atomic 版就拒绝启动。
 
 路径必须为绝对路径且可写；可以选择 NAS 挂载点，也可以在测试阶段显式选择本机目录。默认值为 `/home/ubuntu/hg_dagger_data`。
 
@@ -178,7 +182,7 @@ pre-roll/HOLD 动作当成 expert label。上一条 episode 后台编码时，�
 ```bash
 /home/ubuntu/miniconda3/envs/lerobot/bin/python \
   /home/ubuntu/ros2_ws/src/autolife-hd-dagger/autolife_hg_dagger/scripts/validate_hg_atomic_dataset.py \
-  /path/to/hg_data/my_task/hg_dagger_rgbd/atomic_dataset_v1
+  /home/ubuntu/hg_dagger_data_300/hd300_vla_vr_01/hg_dagger_rgbd/atomic_dataset_v1
 ```
 
 只有输出 `PASS` 且 `.staging` 为空，才把该批数据交给后续导出器。
