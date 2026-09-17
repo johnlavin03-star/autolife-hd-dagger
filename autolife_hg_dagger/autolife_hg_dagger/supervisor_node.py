@@ -1246,6 +1246,35 @@ class HgDaggerSupervisor(Node):
                 response.message = str(exc)
         return response
 
+    def shutdown_recording(self) -> None:
+        """Close active sidecar metadata without ever claiming a save."""
+
+        with self._lock:
+            if not self._intervention_id:
+                return
+            result = None
+            if self._recorder_active:
+                result = self._collector.command_and_wait(
+                    self._active_depth,
+                    str(self.get_parameter("collector_discard_command").value),
+                    min(
+                        2.0,
+                        float(self.get_parameter("collector_command_timeout_sec").value),
+                    ),
+                )
+            collector_ok = bool(
+                result is not None and result.acknowledged and result.success
+            )
+            status = "aborted_shutdown" if collector_ok else "collector_unavailable"
+            self._trace.finish(
+                status,
+                self._expert_command_count,
+                "supervisor shutdown",
+                None if result is None else result.as_dict(),
+            )
+            self._intervention_id = ""
+            self._recorder_active = False
+
 
 def main(args=None) -> None:
     rclpy.init(args=args)
@@ -1257,6 +1286,7 @@ def main(args=None) -> None:
     except KeyboardInterrupt:
         pass
     finally:
+        node.shutdown_recording()
         executor.shutdown()
         node.destroy_node()
         if rclpy.ok():
