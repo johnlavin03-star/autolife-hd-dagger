@@ -30,6 +30,7 @@ from .core import (
     left_y_snapshot,
     policy_takeover_timing,
     policy_to_controller,
+    right_a_snapshot,
     right_b_snapshot,
     stamped_envelope,
     xa_snapshot,
