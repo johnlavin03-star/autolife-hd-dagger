@@ -4,6 +4,7 @@ hg_dagger_supervisor:
     rgbd_only: true
     y_long_press_seconds: 1.2
     policy_button_hold_seconds: 1.2
+    policy_takeover_min_active_seconds: 6.0
     hud_save_notice_seconds: 5.0
     xa_reset_hold_seconds: 1.0
     xa_reset_timeout_sec: 25.0

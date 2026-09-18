@@ -47,7 +47,7 @@ class AuthorityStateMachine:
             raise ValueError("cannot enable while ESTOP is latched")
         return self._move(
             Mode.POLICY_STOPPED,
-            "session enabled; waiting for operator long-A policy start",
+            "session enabled; waiting for operator long-X policy start",
         )
 
     def start_policy(self) -> Transition:
@@ -55,7 +55,7 @@ class AuthorityStateMachine:
             raise ValueError(f"policy start is invalid in {self.mode.value}")
         return self._move(
             Mode.POLICY_WARMUP,
-            "operator long-A requested policy start",
+            "operator long-X requested policy start",
         )
 
     def stop_policy(self) -> Transition:
@@ -193,6 +193,11 @@ def left_y_snapshot(packet: Dict[str, Any]) -> bool:
     return bool(controller.get("yButton", False)) if isinstance(controller, dict) else False
 
 
+def left_x_snapshot(packet: Dict[str, Any]) -> bool:
+    controller = packet.get("leftController")
+    return bool(controller.get("xButton", False)) if isinstance(controller, dict) else False
+
+
 def right_a_snapshot(packet: Dict[str, Any]) -> bool:
     controller = packet.get("rightController")
     return bool(controller.get("aButton", False)) if isinstance(controller, dict) else False
@@ -212,6 +217,18 @@ def xa_snapshot(packet: Dict[str, Any]) -> bool:
         and left.get("xButton", False)
         and right.get("aButton", False)
     )
+
+
+def policy_takeover_timing(
+    active_since_ns: int, now_ns: int, minimum_seconds: float,
+) -> Tuple[bool, float, float]:
+    """Return (ready, elapsed, remaining) for the operator takeover gate."""
+    minimum = max(0.0, float(minimum_seconds))
+    if active_since_ns <= 0 or now_ns < active_since_ns:
+        return minimum == 0.0, 0.0, minimum
+    elapsed = max(0.0, (int(now_ns) - int(active_since_ns)) / 1e9)
+    remaining = max(0.0, minimum - elapsed)
+    return remaining <= 0.0, elapsed, remaining
 
 
 def controller_hold_confirmed(status: Dict[str, Any]) -> bool:

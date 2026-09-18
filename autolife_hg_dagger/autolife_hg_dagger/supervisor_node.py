@@ -26,9 +26,10 @@ from .core import (
     controller_hold_confirmed,
     expert_timeout_requires_estop,
     grip_snapshot,
+    left_x_snapshot,
     left_y_snapshot,
+    policy_takeover_timing,
     policy_to_controller,
-    right_a_snapshot,
     right_b_snapshot,
     stamped_envelope,
     xa_snapshot,
@@ -64,8 +65,8 @@ class HgDaggerSupervisor(Node):
         self._active_depth = False
         self._y_pressed = False
         self._y_press_ns = 0
-        self._a_press_ns = 0
-        self._a_consumed = False
+        self._x_press_ns = 0
+        self._x_chord_seen = False
         self._b_press_ns = 0
         self._b_consumed = False
         self._grips = (False, False)
@@ -77,6 +78,7 @@ class HgDaggerSupervisor(Node):
         self._expert_command_pending = False
         self._expert_forwarded_monotonic_ns = 0
         self._policy_warmup_started_ns = 0
+        self._policy_active_since_ns = 0
         self._policy_warmup_count = 0
         self._policy_warmup_last_action: Optional[list[float]] = None
         self._policy_warmup_reference_jump_deg = 0.0
@@ -205,6 +207,7 @@ class HgDaggerSupervisor(Node):
             "rgbd_only": True,
             "y_long_press_seconds": 1.2,
             "policy_button_hold_seconds": 1.2,
+            "policy_takeover_min_active_seconds": 6.0,
             "hud_save_notice_seconds": 5.0,
             "xa_reset_hold_seconds": 1.0,
             "xa_reset_timeout_sec": 25.0,
@@ -296,6 +299,7 @@ class HgDaggerSupervisor(Node):
     def _begin_failure_hold(self, reason: str) -> None:
         self._last_failure_reason = str(reason)
         transition = self._machine.failure(reason)
+        self._policy_active_since_ns = 0
         self._release_gate_started_ns = 0
         self._expert_command_pending = False
         self._publish_release_hold(reason)
@@ -353,6 +357,7 @@ class HgDaggerSupervisor(Node):
         transition = self._machine.start_policy()
         self._publish_release_hold("policy start warmup barrier")
         self._policy_warmup_started_ns = time.monotonic_ns()
+        self._policy_active_since_ns = 0
         self._policy_warmup_count = 0
         self._policy_warmup_last_action = None
         self._policy_warmup_reference_jump_deg = 0.0
@@ -367,6 +372,7 @@ class HgDaggerSupervisor(Node):
         transition = self._machine.stop_policy()
         self._publish_release_hold("operator stopped policy inference")
         self._policy_warmup_started_ns = 0
+        self._policy_active_since_ns = 0
         self._policy_warmup_count = 0
         self._policy_warmup_last_action = None
         self._policy_warmup_rejection = ""
@@ -377,39 +383,52 @@ class HgDaggerSupervisor(Node):
         )
 
     def _update_policy_button_gestures_locked(
-        self, a_pressed: bool, b_pressed: bool, now_ns: int,
+        self, x_pressed: bool, a_pressed: bool, b_pressed: bool, now_ns: int,
     ) -> None:
-        """Handle deliberate long A/B policy control with both Grips released."""
-        if not a_pressed:
-            self._a_press_ns = 0
-            self._a_consumed = False
+        """Handle X-start/B-stop while giving the X+A reset chord priority.
+
+        X-only is committed on release.  This prevents a reset chord from first
+        being interpreted as a policy-start gesture when the buttons are not
+        pressed on exactly the same WebXR frame.
+        """
         if not b_pressed:
             self._b_press_ns = 0
             self._b_consumed = False
-        if any(self._grips) or (a_pressed and b_pressed):
-            if a_pressed:
-                self._a_press_ns = 0
+        if x_pressed:
+            if not self._x_press_ns:
+                self._x_press_ns = now_ns
+                self._x_chord_seen = bool(a_pressed)
+            elif a_pressed:
+                self._x_chord_seen = True
+        elif self._x_press_ns:
+            duration = (now_ns - self._x_press_ns) / 1e9
+            chord_seen = self._x_chord_seen
+            self._x_press_ns = 0
+            self._x_chord_seen = False
+            threshold = float(self.get_parameter(
+                "policy_button_hold_seconds").value)
+            if duration >= threshold and not chord_seen:
+                if any(self._grips):
+                    self._event(
+                        "gesture_rejected", "long X requires both Grips released"
+                    )
+                elif self._machine.mode == Mode.POLICY_STOPPED:
+                    self._start_policy_locked(
+                        "operator long-X requested policy start"
+                    )
+                else:
+                    self._event(
+                        "gesture_rejected",
+                        f"long X requires POLICY_STOPPED (mode={self._machine.mode.value})",
+                    )
+
+        if any(self._grips) or (x_pressed and a_pressed):
             if b_pressed:
                 self._b_press_ns = 0
             return
 
         threshold = float(self.get_parameter(
             "policy_button_hold_seconds").value)
-        if a_pressed and not self._a_consumed:
-            if not self._a_press_ns:
-                self._a_press_ns = now_ns
-            elif (now_ns - self._a_press_ns) / 1e9 >= threshold:
-                self._a_consumed = True
-                if self._machine.mode == Mode.POLICY_STOPPED:
-                    self._start_policy_locked(
-                        "operator long-A requested policy start"
-                    )
-                else:
-                    self._event(
-                        "gesture_rejected",
-                        f"long A requires POLICY_STOPPED (mode={self._machine.mode.value})",
-                    )
-
         if b_pressed and not self._b_consumed:
             if not self._b_press_ns:
                 self._b_press_ns = now_ns
@@ -510,7 +529,26 @@ class HgDaggerSupervisor(Node):
                 self._grips = grip_snapshot(packet)
             grip_rising = any(now and not old for now, old in zip(self._grips, previous_grips))
             if grip_rising and self._machine.mode == Mode.POLICY_ACTIVE:
-                self._begin_failure_hold("operator Grip requested takeover")
+                ready, _elapsed, remaining = policy_takeover_timing(
+                    self._policy_active_since_ns,
+                    envelope["robot_receive_monotonic_ns"],
+                    float(self.get_parameter(
+                        "policy_takeover_min_active_seconds").value),
+                )
+                if ready:
+                    self._begin_failure_hold("operator Grip requested takeover")
+                else:
+                    minimum = float(self.get_parameter(
+                        "policy_takeover_min_active_seconds").value)
+                    self._set_hud_notice_locked(
+                        f"VLA 需稳定运行满 {minimum:g} 秒；还需 {remaining:.1f} 秒，请松开 Grip 后重试",
+                        level="warning", seconds=2.0,
+                    )
+                    self._event(
+                        "takeover_rejected",
+                        "operator Grip arrived before minimum policy-active duration",
+                        remaining_seconds=round(remaining, 3),
+                    )
             elif (
                 self._machine.mode == Mode.EXPERT_RELEASE_REQUIRED
                 and not any(self._grips)
@@ -552,6 +590,13 @@ class HgDaggerSupervisor(Node):
             event_type = packet.get("type")
             hand = str(packet.get("hand", "")).lower()
             button = str(packet.get("button", "")).upper()
+            if hand == "left" and button == "X" and event_type in (
+                "button_press", "button_release",
+            ):
+                x_pressed = bool(packet.get(
+                    "pressed", event_type == "button_press"))
+            else:
+                x_pressed = left_x_snapshot(packet)
             if hand == "right" and button == "A" and event_type in (
                 "button_press", "button_release",
             ):
@@ -567,7 +612,8 @@ class HgDaggerSupervisor(Node):
             else:
                 b_pressed = right_b_snapshot(packet)
             self._update_policy_button_gestures_locked(
-                a_pressed, b_pressed, envelope["robot_receive_monotonic_ns"]
+                x_pressed, a_pressed, b_pressed,
+                envelope["robot_receive_monotonic_ns"]
             )
 
             if str(packet.get("hand", "")).lower() == "left" and str(packet.get("button", "")).upper() == "Y" and event_type in ("button_press", "button_release"):
@@ -667,6 +713,15 @@ class HgDaggerSupervisor(Node):
                 return
             if self._machine.mode != Mode.POLICY_ACTIVE:
                 return
+            if bool(payload.get("warmup_only", False)):
+                # The bridge may publish the tail of its warmup chunk before
+                # observing the new authority epoch.  It is validation-only
+                # and must never be forwarded as a real policy command.
+                return
+            if self._policy_active_since_ns <= 0:
+                # Count the takeover guard from the first policy command that
+                # is actually forwarded, not from the warmup-only transition.
+                self._policy_active_since_ns = time.monotonic_ns()
             controller.update({
                 "authority_epoch": self._machine.authority_epoch,
                 "source_sequence": envelope["source_sequence"],
@@ -1102,6 +1157,7 @@ class HgDaggerSupervisor(Node):
         self._finish_intervention_locked(True, reason)
         self._publish_release_hold("policy warmup barrier")
         self._policy_warmup_started_ns = time.monotonic_ns()
+        self._policy_active_since_ns = 0
         self._policy_warmup_count = 0
         self._policy_warmup_last_action = None
         self._policy_warmup_reference_jump_deg = 0.0
@@ -1270,10 +1326,27 @@ class HgDaggerSupervisor(Node):
                 "policy_bridge": dict(self._policy_status),
                 "failure_reason": self._last_failure_reason,
             }
+            takeover_ready, takeover_elapsed, takeover_remaining = policy_takeover_timing(
+                self._policy_active_since_ns,
+                time.monotonic_ns(),
+                float(self.get_parameter(
+                    "policy_takeover_min_active_seconds").value),
+            )
+            state["policy_takeover"] = {
+                "ready": takeover_ready,
+                "elapsed_sec": round(takeover_elapsed, 3),
+                "remaining_sec": round(takeover_remaining, 3),
+                "minimum_sec": float(self.get_parameter(
+                    "policy_takeover_min_active_seconds").value),
+            }
             self._state_pub.publish(String(data=compact(state)))
             prompts = {
-                Mode.POLICY_STOPPED: "VLA 已停止；松开 Grip 并长按 A 开始推理",
-                Mode.POLICY_ACTIVE: "VLA 正在控制；按 Grip 请求人工接管",
+                Mode.POLICY_STOPPED: "VLA 已停止；松开 Grip，长按 X 1.2 秒后松开以开始推理",
+                Mode.POLICY_ACTIVE: (
+                    "VLA 正在控制；按 Grip 请求人工接管"
+                    if takeover_ready else
+                    f"VLA 正在控制；{takeover_remaining:.1f} 秒后可按 Grip 接管"
+                ),
                 Mode.FAILURE_HOLD: (
                     "失败已触发："
                     + (self._last_failure_reason or "VLA/操作者请求")
@@ -1363,13 +1436,15 @@ class HgDaggerSupervisor(Node):
                 self._session_id = f"session-{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
                 transition = self._machine.enable()
                 self._last_policy_monotonic_ns = 0
+                self._policy_active_since_ns = 0
                 self._publish_release_hold(
-                    "session enabled; waiting for operator long-A policy start"
+                    "session enabled; waiting for operator long-X policy start"
                 )
                 self._event("transition", transition.reason, old=transition.old.value, new=transition.new.value)
             elif success:
                 self._finish_intervention_locked(False, "session disabled")
                 transition = self._machine.disable()
+                self._policy_active_since_ns = 0
                 self._event("transition", transition.reason, old=transition.old.value, new=transition.new.value)
                 self._session_id = ""
         response.success = success

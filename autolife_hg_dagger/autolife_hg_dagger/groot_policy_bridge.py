@@ -90,6 +90,7 @@ class GrootPolicyBridge(Node):
             "jpeg_quality": 90,
             "collector_root": "/home/ubuntu/lerobot_data_collector",
             "joint_state_topic": "/topic_arm_whole_body_and_gripper_current_joints_status_0_328",
+            "session_lease_file": "/home/ubuntu/.local/state/autolife_hg_dagger/groot_session_lease.json",
         }
         for name, value in defaults.items():
             self.declare_parameter(name, value)
@@ -239,6 +240,73 @@ class GrootPolicyBridge(Node):
             raise GrootProtocolError("remote policy unexpectedly requires causal Outcome history")
         contract = GrootContract.from_mapping(health.get("contract", {}))
         self._remote, self._contract, self._health = remote, contract, health
+        self._recover_remote_lease()
+
+    def _lease_path(self) -> Path:
+        return Path(str(self.get_parameter("session_lease_file").value)).expanduser()
+
+    def _write_remote_lease(self, proposal: Optional[Mapping[str, Any]] = None) -> None:
+        if not self._session_id:
+            return
+        path = self._lease_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "server_url": str(self.get_parameter("server_url").value).rstrip("/"),
+            "session_id": self._session_id,
+            "proposal_id": (
+                None if proposal is None else str(proposal.get("proposal_id", "")) or None
+            ),
+            "updated_unix_ns": time.time_ns(),
+        }
+        temporary = path.with_suffix(path.suffix + ".tmp")
+        temporary.write_text(compact(payload) + "\n", encoding="utf-8")
+        os.chmod(temporary, 0o600)
+        temporary.replace(path)
+
+    def _clear_remote_lease(self) -> None:
+        try:
+            self._lease_path().unlink(missing_ok=True)
+        except OSError as exc:
+            self.get_logger().warning(f"could not remove GR00T session lease: {exc}")
+
+    def _recover_remote_lease(self) -> None:
+        """Close a session left behind by an interrupted local bridge.
+
+        The remote API deliberately does not expose active-session identifiers.
+        Persisting the session/proposal pair is therefore required to recover
+        safely without restarting the shared THOR container.
+        """
+        path = self._lease_path()
+        if not path.exists():
+            return
+        try:
+            lease = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise GrootProtocolError(f"invalid GR00T session lease {path}: {exc}") from exc
+        expected_url = str(self.get_parameter("server_url").value).rstrip("/")
+        if str(lease.get("server_url", "")).rstrip("/") != expected_url:
+            raise GrootProtocolError(
+                f"GR00T session lease belongs to another server: {lease.get('server_url')}"
+            )
+        session_id = str(lease.get("session_id", ""))
+        proposal_id = str(lease.get("proposal_id") or "")
+        if not session_id:
+            raise GrootProtocolError(f"GR00T session lease has no session_id: {path}")
+        self._set_phase("recovering", "closing interrupted THOR session lease")
+        if proposal_id:
+            try:
+                self._post("/discard", {
+                    "session_id": session_id, "proposal_id": proposal_id,
+                })
+            except GrootProtocolError as exc:
+                # A prior cleanup may already have resolved it.  /close remains
+                # the authoritative check: it still refuses any live proposal.
+                self.get_logger().warning(f"stale proposal discard returned: {exc}")
+        self._post("/close", {"session_id": session_id})
+        self._clear_remote_lease()
+        self.get_logger().warning(
+            f"recovered interrupted THOR session {session_id} from local lease"
+        )
 
     def _camera_frame(self, name: str) -> tuple[Any, float]:
         for spec in self._camera_shm_candidates(name):
@@ -303,30 +371,32 @@ class GrootPolicyBridge(Node):
         proposal, session_id = self._proposal, self._session_id
         if proposal is None or not session_id:
             return
-        try:
-            if self._executed and cancel:
-                self._ack_sequence += 1
-                self._post("/cancel", {
-                    "session_id": session_id,
-                    "ack": self._execution_ack(proposal, self._executed),
-                    "actual_executed_prefix": self._executed,
-                    "observed_state": policy_state_from_q23(self._fresh_q23()),
-                })
-            elif self._executed:
-                self._ack_sequence += 1
-                self._post("/ack", {
-                    "session_id": session_id,
-                    "ack": self._execution_ack(proposal, self._executed),
-                    "actual_executed_prefix": self._executed,
-                    "observed_state": policy_state_from_q23(self._fresh_q23()),
-                })
-            else:
-                self._post("/discard", {
-                    "session_id": session_id, "proposal_id": str(proposal["proposal_id"])
-                })
-        finally:
-            self._proposal = None
-            self._executed = []
+        if self._executed and cancel:
+            self._ack_sequence += 1
+            self._post("/cancel", {
+                "session_id": session_id,
+                "ack": self._execution_ack(proposal, self._executed),
+                "actual_executed_prefix": self._executed,
+                "observed_state": policy_state_from_q23(self._fresh_q23()),
+            })
+        elif self._executed:
+            self._ack_sequence += 1
+            self._post("/ack", {
+                "session_id": session_id,
+                "ack": self._execution_ack(proposal, self._executed),
+                "actual_executed_prefix": self._executed,
+                "observed_state": policy_state_from_q23(self._fresh_q23()),
+            })
+        else:
+            self._post("/discard", {
+                "session_id": session_id, "proposal_id": str(proposal["proposal_id"])
+            })
+        # Only erase the proposal identifier after the remote side confirms it.
+        # On any exception the lease retains enough information for next-start
+        # recovery instead of creating another uncloseable THOR session.
+        self._proposal = None
+        self._executed = []
+        self._write_remote_lease()
 
     def _execution_ack(self, proposal: Mapping[str, Any], actions: list[list[float]]) -> dict[str, Any]:
         return {
@@ -342,11 +412,13 @@ class GrootPolicyBridge(Node):
         if not self._session_id:
             return
         session_id = self._session_id
-        self._session_id = ""
         try:
             self._post("/close", {"session_id": session_id})
         except Exception as exc:
             self.get_logger().warning(f"remote close failed: {exc}")
+            return
+        self._session_id = ""
+        self._clear_remote_lease()
 
     def _request_failure(self, reason: str) -> None:
         self._set_phase("failed", reason)
@@ -354,6 +426,13 @@ class GrootPolicyBridge(Node):
         # Publish immediately rather than waiting for the 5 Hz status timer;
         # the supervisor turns this correlated failure detail into FAILURE_HOLD.
         self._publish_status()
+
+    def _remember_response_proposal(self, response: Mapping[str, Any]) -> None:
+        proposal = response.get("proposal")
+        if isinstance(proposal, Mapping):
+            # Persist before latency validation or execution.  Both paths may
+            # throw, and the remote proposal must still be recoverable then.
+            self._write_remote_lease(proposal)
 
     def _next_response(self, observation: Mapping[str, Any]) -> dict[str, Any]:
         self._set_phase("inference", "waiting for a fresh GR00T proposal")
@@ -364,10 +443,12 @@ class GrootPolicyBridge(Node):
             self._session_id = str(response["session_id"])
         else:
             response = self._post("/infer", {"session_id": self._session_id, **observation})
+        self._remember_response_proposal(response)
         self._check_inference_latency(response)
         while str(response.get("decision")) == "reinfer":
             self._set_phase("retry", str(response.get("reason", "action rejected")))
             response = self._post("/retry", {"session_id": self._session_id})
+            self._remember_response_proposal(response)
             self._check_inference_latency(response)
         return response
 
@@ -397,6 +478,7 @@ class GrootPolicyBridge(Node):
         assert self._contract is not None
         actions = validated_actions(proposal, self._contract)
         self._proposal, self._executed = proposal, []
+        self._write_remote_lease(proposal)
         proposal_id = str(proposal["proposal_id"])
         period = 1.0 / float(self.get_parameter("action_rate_hz").value)
         deadline = time.monotonic()

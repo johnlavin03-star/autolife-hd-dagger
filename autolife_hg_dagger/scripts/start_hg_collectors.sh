@@ -121,7 +121,12 @@ start_one() {
   local log_dir="${session_dir}/logs"
   local log_file="${log_dir}/hg_dagger_recorder_$(date +%Y%m%d_%H%M%S).log"
   local default_dataset_fps=30
-  local max_sync_delta_sec=0.03
+  # Robot 300 hand-camera SHM uses an MJPEG fallback and can legitimately be
+  # one frame behind the head stream.  Anchor episodes to the stable head RGB
+  # clock and permit up to 50 ms skew; the separate 150 ms age limit still
+  # rejects genuinely stale cameras.  Both values remain operator-tunable.
+  local sync_reference_camera="${HG_DAGGER_SYNC_REFERENCE_CAMERA:-rgbd_head_color}"
+  local max_sync_delta_sec="${HG_DAGGER_MAX_SYNC_DELTA_SEC:-0.05}"
   local dataset_fps="${HG_DAGGER_DATASET_FPS:-${default_dataset_fps}}"
 
   if ! grep -q "HG-DAGGER atomic episode store" "${recorder}"; then
@@ -156,6 +161,7 @@ start_one() {
     --image-source shm
     --image-poll-fps 120
     --min-cameras "${min_cameras}"
+    --sync-reference-camera "${sync_reference_camera}"
     --max-sync-delta-sec "${max_sync_delta_sec}"
     --max-image-age-sec 0.15
     --max-state-age-sec 0.15

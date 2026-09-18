@@ -129,7 +129,7 @@ function showVrNotice(message, durationMs = 3500, color = '#7DFFCF') {
 
 const HG_DAGGER_MODE_LABELS = {
   DISARMED: '未使能',
-  POLICY_STOPPED: 'VLA 已停止 · 长按 A 开始',
+  POLICY_STOPPED: 'VLA 已停止 · 长按 X 1.2 秒后松开开始',
   POLICY_ACTIVE: 'VLA 控制',
   FAILURE_HOLD: '请求接管 · 机器人保持',
   EXPERT_RELEASE_REQUIRED: '请完全松开双 Grip',

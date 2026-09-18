@@ -7,9 +7,10 @@ from autolife_hg_dagger.core import (
     controller_hold_confirmed,
     expert_timeout_requires_estop,
     grip_snapshot,
+    left_x_snapshot,
     left_y_snapshot,
+    policy_takeover_timing,
     policy_to_controller,
-    right_a_snapshot,
     right_b_snapshot,
     xa_snapshot,
 )
@@ -81,12 +82,12 @@ def test_invalid_policy_action(action):
 
 def test_vr_gestures_from_existing_web_payload():
     packet = {
-        "leftController": {"gripActive": True, "yButton": 1},
+        "leftController": {"gripActive": True, "xButton": 1, "yButton": 1},
         "rightController": {"gripActive": False, "aButton": 1},
     }
     assert grip_snapshot(packet) == (True, False)
     assert left_y_snapshot(packet)
-    assert right_a_snapshot(packet)
+    assert left_x_snapshot(packet)
     assert not right_b_snapshot(packet)
     assert not both_grips_released(packet)
     assert not xa_snapshot(packet)
@@ -98,6 +99,17 @@ def test_xa_reset_gesture_requires_both_buttons():
         "rightController": {"aButton": 1},
     }
     assert xa_snapshot(packet)
+
+
+def test_policy_takeover_requires_six_active_seconds():
+    started = 10_000_000_000
+    assert policy_takeover_timing(started, started + 5_999_000_000, 6.0)[0] is False
+    ready, elapsed, remaining = policy_takeover_timing(
+        started, started + 6_000_000_000, 6.0
+    )
+    assert ready
+    assert elapsed == pytest.approx(6.0)
+    assert remaining == 0.0
 
 
 def test_reset_returns_expert_pause_to_reanchor_gate():

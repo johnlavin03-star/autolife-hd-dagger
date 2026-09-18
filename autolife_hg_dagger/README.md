@@ -6,7 +6,8 @@
 
 - VLA joint action 与 VR expert action 的单点控制权仲裁。
 - `POLICY_STOPPED → POLICY_WARMUP → POLICY_ACTIVE → FAILURE_HOLD → EXPERT_RELEASE_REQUIRED → EXPERT_READY → EXPERT_ACTIVE → POLICY_WARMUP` 状态机。
-- 网页使能后默认保持 `POLICY_STOPPED`，不会请求 THOR 推理。双 Grip 松开时长按右 A 1.2 秒进入 VLA warmup；在 VLA 预热或控制期间长按右 B 1.2 秒立即保持机器人并返回 `POLICY_STOPPED`。短按 B 仍保留原有视角切换。
+- 网页使能后默认保持 `POLICY_STOPPED`，不会请求 THOR 推理。双 Grip 松开时长按左 X 1.2 秒并松开进入 VLA warmup；单独 X 在松开时生效，因此不会与 X+A 复位混淆。在 VLA 预热或控制期间长按右 B 1.2 秒立即保持机器人并返回 `POLICY_STOPPED`。短按 B 仍保留原有视角切换。
+- 每次进入 `POLICY_ACTIVE` 后必须连续稳定运行至少 6 秒，Grip 才能请求人工接管；提前按下会继续保持 VLA 控制并在 HUD 显示剩余时间。
 - 长按 Y 交还后，VLA warmup 与 RGBD 视频编码并行；warmup 连续输出稳定后恢复策略，采集器在后台完成 manifest ACK，避免长片段编码阻塞控制状态。
 - 在 `EXPERT_RELEASE_REQUIRED`、`EXPERT_READY`，或双 Grip 已松开的 `EXPERT_ACTIVE` 中，长按左 X + 右 A 1 秒可请求原控制器的碰撞检查快速复位。复位全程仍经过 HG-DAgger 仲裁，完成后必须重新按 Grip 锚定；含复位运动的 intervention 会被标记为不可训练并丢弃。
 - 接管前向 controller 发双臂 `release_hold`，等待 controller 报告 `HOLDING` 后才允许 VR 目标通过。
