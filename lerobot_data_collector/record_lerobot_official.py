@@ -2272,6 +2272,64 @@ class OfficialLeRobotRecorder(Node):
         )
         return True
 
+    def pause_current_episode(self, reason: str, request_id: str | None = None) -> bool:
+        """Seal the current frame range without encoding or discarding it.
+
+        HG-DAGGER uses this at the Y hand-back boundary.  The robot can resume
+        policy execution while the exact pre-failure/HOLD/expert range remains
+        frozen in memory.  A later save command, issued only after policy stop
+        and robot reset, performs the expensive video encoding while the robot
+        is stationary.
+        """
+
+        has_buffered_frames = self.has_pending_episode() and self.current_episode_frames > 0
+        if self.dataset is None or not has_buffered_frames:
+            self.is_recording = False
+            self._release_motion_lock()
+            self._write_command_status(
+                "pause", False, request_id, message="no pending episode to pause"
+            )
+            return False
+        if not self.is_recording:
+            self._write_command_status(
+                "pause",
+                True,
+                request_id,
+                episode_index=(
+                    int(self.active_atomic_sequence)
+                    if self.active_atomic_sequence is not None else self.saved_episodes
+                ),
+                frames=self.current_episode_frames,
+                message="episode is already sealed",
+            )
+            return True
+        self.is_recording = False
+        self._release_motion_lock()
+        episode_index = (
+            int(self.active_atomic_sequence)
+            if self.active_atomic_sequence is not None else self.saved_episodes
+        )
+        self._log_sync({
+            "event": "episode_paused",
+            "episode_index": episode_index,
+            "frames": self.current_episode_frames,
+            "reason": reason,
+            "invalid_reason": self.episode_invalid_reason,
+            "wall_time": time.time(),
+        })
+        self._write_command_status(
+            "pause",
+            True,
+            request_id,
+            episode_index=episode_index,
+            frames=self.current_episode_frames,
+            message=(
+                f"episode sealed but invalid: {self.episode_invalid_reason}"
+                if self.episode_invalid else "episode sealed; awaiting save or discard"
+            ),
+        )
+        return True
+
     def discard_current_episode(self, reason: str, request_id: str | None = None) -> bool:
         invalid_reason = self.episode_invalid_reason
         has_buffered_frames = self.has_pending_episode() and self.current_episode_frames > 0
@@ -2384,6 +2442,8 @@ class OfficialLeRobotRecorder(Node):
                 self.start_episode(f"command:{command}", request_id)
             elif command == "save":
                 self.save_current_episode("command:save", request_id)
+            elif command in ("pause", "seal"):
+                self.pause_current_episode(f"command:{command}", request_id)
             elif command == "discard":
                 self.discard_current_episode("command:discard", request_id)
             elif command == "quit":

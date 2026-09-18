@@ -75,6 +75,9 @@ class HgDaggerSupervisor(Node):
         self._intervention_reset_used = False
         self._intervention_failure_context_valid = True
         self._recorder_active = False
+        self._intervention_sealed = False
+        self._round_commit_after_reset = False
+        self._round_index = 0
         self._release_gate_started_ns = 0
         self._expert_command_pending = False
         self._expert_forwarded_monotonic_ns = 0
@@ -228,6 +231,7 @@ class HgDaggerSupervisor(Node):
             "rgb_collector_fifo": "/tmp/hg_dagger_rgb_collector.fifo",
             "rgbd_collector_fifo": "/tmp/hg_dagger_rgbd_collector.fifo",
             "collector_start_command": "start",
+            "collector_pause_command": "pause",
             "collector_save_command": "save",
             "collector_discard_command": "discard",
             "collector_command_timeout_sec": 15.0,
@@ -298,6 +302,21 @@ class HgDaggerSupervisor(Node):
         self._hold_sent_monotonic_ns = time.monotonic_ns()
 
     def _begin_failure_hold(self, reason: str) -> None:
+        if self._intervention_sealed:
+            # One round may contain exactly one correction.  After Y the
+            # correction is frozen and policy runs only for recovery checking;
+            # a second takeover must not overwrite that pending episode.
+            if self._machine.mode in (Mode.POLICY_ACTIVE, Mode.POLICY_WARMUP):
+                self._stop_policy_locked(
+                    "policy stopped after a sealed correction requested another hold"
+                )
+            self._publish_release_hold("sealed correction awaiting reset and save")
+            self._set_hud_notice_locked(
+                "本轮纠正已封存；请长按 X+A 复位并保存",
+                level="warning", seconds=5.0,
+            )
+            self._event("takeover_rejected", "sealed round must be reset and saved first")
+            return
         self._last_failure_reason = str(reason)
         transition = self._machine.failure(reason)
         self._policy_active_since_ns = 0
@@ -333,12 +352,15 @@ class HgDaggerSupervisor(Node):
             or self._dagger_reset_active
         ):
             return
-        allowed = (
-            not any(self._grips)
-            and self._machine.mode in (
+        allowed = not any(self._grips) and (
+            self._machine.mode in (
                 Mode.EXPERT_RELEASE_REQUIRED,
                 Mode.EXPERT_READY,
                 Mode.EXPERT_ACTIVE,
+            )
+            or (
+                self._intervention_sealed
+                and self._machine.mode == Mode.POLICY_STOPPED
             )
         )
         if not allowed:
@@ -355,7 +377,22 @@ class HgDaggerSupervisor(Node):
         self._request_quick_reset_locked()
 
     def _start_policy_locked(self, reason: str) -> None:
+        if self._collector_finalize_pending:
+            self._set_hud_notice_locked(
+                "上一轮数据仍在保存，请等待完成",
+                level="warning", seconds=3.0,
+            )
+            self._event("policy_start_rejected", "collector finalization is pending")
+            return
+        if self._intervention_id or self._intervention_sealed:
+            self._set_hud_notice_locked(
+                "请先完成本轮 B 停止、X+A 复位和数据保存",
+                level="warning", seconds=4.0,
+            )
+            self._event("policy_start_rejected", "current round is not finalized")
+            return
         transition = self._machine.start_policy()
+        self._round_index += 1
         self._publish_release_hold("policy start warmup barrier")
         self._policy_warmup_started_ns = time.monotonic_ns()
         self._policy_active_since_ns = 0
@@ -441,6 +478,11 @@ class HgDaggerSupervisor(Node):
                     self._stop_policy_locked(
                         "operator long-B stopped policy inference"
                     )
+                    if self._intervention_sealed:
+                        self._set_hud_notice_locked(
+                            "VLA 已停止；请长按 X+A 复位，复位后自动保存本轮",
+                            level="info", seconds=6.0,
+                        )
                 else:
                     self._event(
                         "gesture_rejected",
@@ -465,13 +507,19 @@ class HgDaggerSupervisor(Node):
             )
             return
         self._publish_release_hold("X+A quick reset authority barrier")
-        if self._intervention_id:
+        completing_sealed_round = bool(
+            self._intervention_sealed
+            and self._intervention_id
+            and self._machine.mode == Mode.POLICY_STOPPED
+        )
+        if self._intervention_id and not completing_sealed_round:
             self._intervention_reset_used = True
             self._event(
                 "intervention_invalidated",
                 "quick reset occurred inside intervention; episode will be discarded",
             )
         self._dagger_reset_pending = True
+        self._round_commit_after_reset = completing_sealed_round
         future = self._controller_quick_reset.call_async(Trigger.Request())
 
         def finished(done: Any) -> None:
@@ -502,6 +550,21 @@ class HgDaggerSupervisor(Node):
         self._dagger_reset_started_ns = 0
         self._expert_command_pending = False
         self._last_expert_monotonic_ns = 0
+        if self._round_commit_after_reset:
+            self._round_commit_after_reset = False
+            self._publish_release_hold("round reset completed; saving sealed correction")
+            self._event(
+                "round_reset_completed",
+                "robot reset completed; sealed correction is being saved",
+            )
+            self._set_hud_notice_locked(
+                "复位完成；正在保存本轮纠正数据，请勿开始下一轮",
+                level="info", seconds=30.0,
+            )
+            self._finish_intervention_locked(
+                True, "round completed after policy stop and quick reset"
+            )
+            return
         try:
             transition = self._machine.reset_to_expert_ready()
         except ValueError as exc:
@@ -931,6 +994,7 @@ class HgDaggerSupervisor(Node):
         self._active_depth = self._depth_next
         self._expert_command_count = 0
         self._intervention_reset_used = False
+        self._intervention_sealed = False
         self._intervention_failure_context_valid = bool(failure_context_valid)
         self._trace.start(
             self._session_id,
@@ -1020,6 +1084,8 @@ class HgDaggerSupervisor(Node):
                 self._collector_finalize_pending += 1
                 self._intervention_id = ""
                 self._recorder_active = False
+                self._intervention_sealed = False
+                self._round_commit_after_reset = False
                 threading.Thread(
                     target=self._finalize_collector_save,
                     args=(
@@ -1074,6 +1140,8 @@ class HgDaggerSupervisor(Node):
         )
         self._intervention_id = ""
         self._recorder_active = False
+        self._intervention_sealed = False
+        self._round_commit_after_reset = False
 
     def _finalize_collector_save(
         self, depth: bool, command: str, request_id: str, manifest_path: Any,
@@ -1121,20 +1189,20 @@ class HgDaggerSupervisor(Node):
                     else str(result.episode_index)
                 )
                 self._set_hud_notice_locked(
-                    f"✓ 当前纠正片段已保存 · episode {episode_label} · {result.frames} 帧",
+                    f"✓ 第 {self._round_index} 轮纠正片段已保存 · episode {episode_label} · {result.frames} 帧；长按 X 开始下一轮",
                     level="success",
                     seconds=float(self.get_parameter(
                         "hud_save_notice_seconds").value),
                 )
             elif status == "discarded_invalid":
                 self._set_hud_notice_locked(
-                    f"当前片段无效，已丢弃：{result.message}",
+                    f"第 {self._round_index} 轮数据无效，已丢弃：{result.message}；长按 X 重试",
                     level="warning",
                     seconds=8.0,
                 )
             elif status == "collector_command_failed":
                 self._set_hud_notice_locked(
-                    f"片段保存失败：{result.message}",
+                    f"第 {self._round_index} 轮保存失败：{result.message}；请检查后长按 X 重试",
                     level="error",
                     seconds=8.0,
                 )
@@ -1168,8 +1236,29 @@ class HgDaggerSupervisor(Node):
                     )
 
     def _resume_locked(self, reason: str) -> None:
+        pause_result = self._collector.command_and_wait(
+            self._active_depth,
+            str(self.get_parameter("collector_pause_command").value),
+            float(self.get_parameter("collector_command_timeout_sec").value),
+        )
+        if not pause_result.acknowledged or not pause_result.success:
+            transition = self._machine.estop(
+                f"collector failed to seal correction: {pause_result.message}"
+            )
+            self._publish_release_hold("collector seal failed")
+            self._event(
+                "collector_pause_failed", pause_result.message,
+                old=transition.old.value, new=transition.new.value,
+            )
+            return
+        self._intervention_sealed = True
+        self._event(
+            "intervention_sealed",
+            "Y hand-back froze pre-failure, HOLD, and expert correction frames",
+            collector_episode_index=pause_result.episode_index,
+            collector_frames=pause_result.frames,
+        )
         transition = self._machine.resume()
-        self._finish_intervention_locked(True, reason)
         self._publish_release_hold("policy warmup barrier")
         self._policy_warmup_started_ns = time.monotonic_ns()
         self._policy_active_since_ns = 0
@@ -1179,6 +1268,10 @@ class HgDaggerSupervisor(Node):
         self._policy_warmup_rejection = ""
         self._last_policy_monotonic_ns = self._policy_warmup_started_ns
         self._event("transition", transition.reason, old=transition.old.value, new=transition.new.value)
+        self._set_hud_notice_locked(
+            "纠正段已封存；VLA 恢复后长按 B 停止，再长按 X+A 复位并保存",
+            level="info", seconds=6.0,
+        )
 
     def _control_tick(self) -> None:
         with self._lock:
@@ -1333,6 +1426,14 @@ class HgDaggerSupervisor(Node):
                 },
                 "collector_finalize_pending": bool(self._collector_finalize_pending),
                 "collector_finalize_pending_count": self._collector_finalize_pending,
+                "round": {
+                    "index": self._round_index,
+                    "correction_sealed": self._intervention_sealed,
+                    "awaiting_reset": bool(
+                        self._intervention_sealed
+                        and self._machine.mode == Mode.POLICY_STOPPED
+                    ),
+                },
                 "quick_reset": {
                     "pending": self._dagger_reset_pending,
                     "active": self._dagger_reset_active,
@@ -1356,7 +1457,13 @@ class HgDaggerSupervisor(Node):
             }
             self._state_pub.publish(String(data=compact(state)))
             prompts = {
-                Mode.POLICY_STOPPED: "VLA 已停止；松开 Grip，长按 X 1.2 秒后松开以开始推理",
+                Mode.POLICY_STOPPED: (
+                    "正在保存上一轮纠正数据；请等待完成"
+                    if self._collector_finalize_pending else
+                    "本轮纠正已封存；长按 X+A 复位，复位后自动保存"
+                    if self._intervention_sealed else
+                    f"长按 X 1.2 秒后松开，开始第 {self._round_index + 1} 轮数据录制"
+                ),
                 Mode.POLICY_ACTIVE: (
                     "VLA 正在控制；按 Grip 请求人工接管"
                     if takeover_ready else
@@ -1449,6 +1556,9 @@ class HgDaggerSupervisor(Node):
         with self._lock:
             if success and request.data:
                 self._session_id = f"session-{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
+                self._round_index = 0
+                self._intervention_sealed = False
+                self._round_commit_after_reset = False
                 transition = self._machine.enable()
                 self._last_policy_monotonic_ns = 0
                 self._policy_active_since_ns = 0
@@ -1530,6 +1640,8 @@ class HgDaggerSupervisor(Node):
             )
             self._intervention_id = ""
             self._recorder_active = False
+            self._intervention_sealed = False
+            self._round_commit_after_reset = False
 
 
 def main(args=None) -> None:

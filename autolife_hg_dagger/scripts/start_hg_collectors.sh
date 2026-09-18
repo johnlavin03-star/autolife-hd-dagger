@@ -130,6 +130,26 @@ start_one() {
   local max_consecutive_reference_interval_errors="${HG_DAGGER_MAX_CONSECUTIVE_REFERENCE_INTERVAL_ERRORS:-1}"
   local dataset_fps="${HG_DAGGER_DATASET_FPS:-${default_dataset_fps}}"
 
+  # Two paused collectors still decode every SHM camera frame.  On robot 300
+  # that consumed enough CPU to push otherwise healthy state/camera samples
+  # just beyond their 150 ms freshness limit while an episode was being packed.
+  # Refuse a second HG-DAGGER collector for the same robot instead of silently
+  # degrading both datasets.
+  local proc_dir existing_pid existing_cmd
+  for proc_dir in /proc/[0-9]*; do
+    [ -r "${proc_dir}/cmdline" ] || continue
+    existing_pid="${proc_dir##*/}"
+    existing_cmd="$(tr '\0' ' ' < "${proc_dir}/cmdline" 2>/dev/null || true)"
+    if [[ "${existing_cmd}" == *"record_lerobot_official.py"* \
+        && "${existing_cmd}" == *"--state-topic /topic_arm_whole_body_and_gripper_current_joints_status_${topic_suffix}"* \
+        && "${existing_cmd}" != *"--output-dir ${dataset_root}"* ]]; then
+      echo "ERROR: another HG-DAGGER collector for robot ${robot_id} is already running" >&2
+      echo "  PID ${existing_pid}: ${existing_cmd}" >&2
+      echo "Stop its task-specific collector before starting ${task_name}." >&2
+      return 1
+    fi
+  done
+
   if ! grep -q "HG-DAGGER atomic episode store" "${recorder}"; then
     echo "ERROR: repository-local HG-DAGGER atomic recorder is invalid: ${recorder}" >&2
     return 1
