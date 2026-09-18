@@ -189,6 +189,8 @@ CONTROL_MODE_CODES = {
     "EXPERT_ACTIVE": 6,
     "POLICY_WARMUP": 7,
     "ESTOP": 8,
+    # Append new modes instead of renumbering the established on-disk schema.
+    "POLICY_STOPPED": 9,
 }
 
 

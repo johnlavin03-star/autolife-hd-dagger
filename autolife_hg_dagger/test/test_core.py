@@ -9,25 +9,39 @@ from autolife_hg_dagger.core import (
     grip_snapshot,
     left_y_snapshot,
     policy_to_controller,
+    right_a_snapshot,
+    right_b_snapshot,
     xa_snapshot,
 )
 
 
 def test_hg_dagger_recovery_cycle():
     machine = AuthorityStateMachine()
-    assert machine.enable().new == Mode.POLICY_ACTIVE
+    assert machine.enable().new == Mode.POLICY_STOPPED
+    assert machine.start_policy().new == Mode.POLICY_WARMUP
+    assert machine.warmup_complete().new == Mode.POLICY_ACTIVE
     assert machine.failure().new == Mode.FAILURE_HOLD
     assert machine.hold_confirmed().new == Mode.EXPERT_RELEASE_REQUIRED
     assert machine.expert_release_confirmed().new == Mode.EXPERT_READY
     assert machine.expert_first_command().new == Mode.EXPERT_ACTIVE
     assert machine.resume().new == Mode.POLICY_WARMUP
     assert machine.warmup_complete().new == Mode.POLICY_ACTIVE
-    assert machine.authority_epoch == 7
+    assert machine.authority_epoch == 9
+
+
+def test_policy_can_be_stopped_and_restarted_by_operator():
+    machine = AuthorityStateMachine()
+    machine.enable()
+    machine.start_policy()
+    assert machine.stop_policy().new == Mode.POLICY_STOPPED
+    assert machine.start_policy().new == Mode.POLICY_WARMUP
 
 
 def test_expert_cannot_become_ready_before_release_confirmation():
     machine = AuthorityStateMachine()
     machine.enable()
+    machine.start_policy()
+    machine.warmup_complete()
     machine.failure()
     machine.hold_confirmed()
     with pytest.raises(ValueError):
@@ -72,6 +86,8 @@ def test_vr_gestures_from_existing_web_payload():
     }
     assert grip_snapshot(packet) == (True, False)
     assert left_y_snapshot(packet)
+    assert right_a_snapshot(packet)
+    assert not right_b_snapshot(packet)
     assert not both_grips_released(packet)
     assert not xa_snapshot(packet)
 
@@ -87,6 +103,8 @@ def test_xa_reset_gesture_requires_both_buttons():
 def test_reset_returns_expert_pause_to_reanchor_gate():
     machine = AuthorityStateMachine()
     machine.enable()
+    machine.start_policy()
+    machine.warmup_complete()
     machine.failure()
     machine.hold_confirmed()
     machine.expert_release_confirmed()

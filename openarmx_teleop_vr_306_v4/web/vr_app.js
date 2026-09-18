@@ -129,6 +129,7 @@ function showVrNotice(message, durationMs = 3500, color = '#7DFFCF') {
 
 const HG_DAGGER_MODE_LABELS = {
   DISARMED: '未使能',
+  POLICY_STOPPED: 'VLA 已停止 · 长按 A 开始',
   POLICY_ACTIVE: 'VLA 控制',
   FAILURE_HOLD: '请求接管 · 机器人保持',
   EXPERT_RELEASE_REQUIRED: '请完全松开双 Grip',
@@ -140,6 +141,21 @@ const HG_DAGGER_MODE_LABELS = {
 
 function hgDaggerVisualState(hgDagger) {
   const mode = String(hgDagger?.mode || 'DISARMED');
+  const notice = hgDagger?.notice;
+  if (notice?.text) {
+    const colors = {
+      success: '#7DFFCF',
+      error: '#FF6B6B',
+      warning: '#FFD166',
+      info: '#79C7FF'
+    };
+    return {
+      key: `NOTICE:${notice.token ?? notice.text}`,
+      label: String(notice.text),
+      color: colors[String(notice.level || 'info')] || colors.info,
+      notice: true
+    };
+  }
   const resetActive = hgDagger?.quick_reset?.pending === true
     || hgDagger?.quick_reset?.active === true;
   const paused = mode === 'EXPERT_ACTIVE' && hgDagger?.expert_paused === true;
@@ -152,7 +168,8 @@ function hgDaggerVisualState(hgDagger) {
       : ['FAILURE_HOLD', 'EXPERT_RELEASE_REQUIRED'].includes(mode) ? '#FFB86B'
         : ['EXPERT_READY', 'EXPERT_ACTIVE'].includes(mode) ? '#7DFFCF'
           : mode === 'POLICY_ACTIVE' || mode === 'POLICY_WARMUP' ? '#79C7FF'
-            : '#D7E0EA'
+            : '#D7E0EA',
+    notice: false
   };
 }
 
@@ -224,7 +241,9 @@ function updateHgStatusHud(hgDagger, { forceCurrent = false } = {}) {
     window.clearTimeout(state.hgStatusHudTimer);
     state.hgStatusHudTimer = null;
   }
-  if (changed && !forceCurrent) {
+  if (next.notice || String(previousKey || '').startsWith('NOTICE:')) {
+    drawHgStatusHud(next.notice ? next.label : `当前：${next.label}`, next.color);
+  } else if (changed && !forceCurrent) {
     const previous = hgDaggerVisualState({
       mode: previousKey.split(':')[0],
       expert_paused: previousKey.endsWith(':paused')
@@ -2257,6 +2276,7 @@ AFRAME.registerComponent('telegrip-vr-bridge', {
     this.rightHand = document.getElementById('rightHand');
     this.leftButtons = { grip: false, gripValue: 0, trigger: 0, x: false, y: false, thumbstick: { x: 0, y: 0, pressed: 0 } };
     this.rightButtons = { grip: false, gripValue: 0, trigger: 0, a: false, b: false, thumbstick: { x: 0, y: 0, pressed: 0 } };
+    this.rightBPressedAt = null;
     this.desktopChordStartedAt = null;
     this.desktopChordConsumed = false;
 
@@ -2330,6 +2350,7 @@ AFRAME.registerComponent('telegrip-vr-bridge', {
     } else {
       this.sendButtonEvent('right', 'A', false);
       this.sendButtonEvent('right', 'B', false);
+      this.rightBPressedAt = null;
     }
     this.clearControllerButtons(buttons, hand);
   },
@@ -2342,6 +2363,23 @@ AFRAME.registerComponent('telegrip-vr-bridge', {
   resetDesktopModeChord: function () {
     this.desktopChordStartedAt = null;
     this.desktopChordConsumed = false;
+  },
+
+  handleCameraModeBDown: function () {
+    if (this.rightBPressedAt === null) {
+      this.rightBPressedAt = performance.now();
+    }
+  },
+
+  handleCameraModeBUp: function () {
+    const startedAt = this.rightBPressedAt;
+    this.rightBPressedAt = null;
+    // B is shared with HG-DAgger policy stop. Preserve the legacy camera
+    // switch only for an unambiguous short tap; a deliberate hold is reserved
+    // exclusively for stopping VLA inference.
+    if (startedAt !== null && performance.now() - startedAt < 700) {
+      toggleCameraMode();
+    }
   },
 
   checkDesktopModeGesture: function (tracked) {
@@ -2419,11 +2457,12 @@ AFRAME.registerComponent('telegrip-vr-bridge', {
         this.sendButtonEvent('right', 'A', false);
       });
       handEl.addEventListener('bbuttondown', () => {
-        if (!buttons.b) toggleCameraMode();
+        if (!buttons.b) this.handleCameraModeBDown();
         buttons.b = true;
         this.sendButtonEvent('right', 'B', true);
       });
       handEl.addEventListener('bbuttonup', () => {
+        if (buttons.b) this.handleCameraModeBUp();
         buttons.b = false;
         this.sendButtonEvent('right', 'B', false);
       });
@@ -2464,8 +2503,10 @@ AFRAME.registerComponent('telegrip-vr-bridge', {
         this.updateGripState(this.rightButtons, buttons[1]);
         this.rightButtons.a = Boolean(buttons[4]?.pressed);
         const previousB = this.rightButtons.b;
-        this.rightButtons.b = Boolean(buttons[5]?.pressed);
-        if (this.rightButtons.b && !previousB) toggleCameraMode();
+        const nextB = Boolean(buttons[5]?.pressed);
+        if (nextB && !previousB) this.handleCameraModeBDown();
+        if (!nextB && previousB) this.handleCameraModeBUp();
+        this.rightButtons.b = nextB;
         this.rightButtons.thumbstick = {
           x,
           y,

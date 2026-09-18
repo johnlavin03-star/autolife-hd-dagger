@@ -10,6 +10,7 @@ from typing import Any, Dict, Optional, Tuple
 
 class Mode(str, Enum):
     DISARMED = "DISARMED"
+    POLICY_STOPPED = "POLICY_STOPPED"
     POLICY_ACTIVE = "POLICY_ACTIVE"
     FAILURE_HOLD = "FAILURE_HOLD"
     EXPERT_RELEASE_REQUIRED = "EXPERT_RELEASE_REQUIRED"
@@ -44,7 +45,26 @@ class AuthorityStateMachine:
     def enable(self) -> Transition:
         if self.mode == Mode.ESTOP:
             raise ValueError("cannot enable while ESTOP is latched")
-        return self._move(Mode.POLICY_ACTIVE, "session enabled without reset")
+        return self._move(
+            Mode.POLICY_STOPPED,
+            "session enabled; waiting for operator long-A policy start",
+        )
+
+    def start_policy(self) -> Transition:
+        if self.mode != Mode.POLICY_STOPPED:
+            raise ValueError(f"policy start is invalid in {self.mode.value}")
+        return self._move(
+            Mode.POLICY_WARMUP,
+            "operator long-A requested policy start",
+        )
+
+    def stop_policy(self) -> Transition:
+        if self.mode not in (Mode.POLICY_ACTIVE, Mode.POLICY_WARMUP):
+            raise ValueError(f"policy stop is invalid in {self.mode.value}")
+        return self._move(
+            Mode.POLICY_STOPPED,
+            "operator long-B stopped policy inference",
+        )
 
     def disable(self) -> Transition:
         return self._move(Mode.DISARMED, "session disabled")
@@ -171,6 +191,16 @@ def grip_snapshot(packet: Dict[str, Any]) -> Tuple[bool, bool]:
 def left_y_snapshot(packet: Dict[str, Any]) -> bool:
     controller = packet.get("leftController")
     return bool(controller.get("yButton", False)) if isinstance(controller, dict) else False
+
+
+def right_a_snapshot(packet: Dict[str, Any]) -> bool:
+    controller = packet.get("rightController")
+    return bool(controller.get("aButton", False)) if isinstance(controller, dict) else False
+
+
+def right_b_snapshot(packet: Dict[str, Any]) -> bool:
+    controller = packet.get("rightController")
+    return bool(controller.get("bButton", False)) if isinstance(controller, dict) else False
 
 
 def xa_snapshot(packet: Dict[str, Any]) -> bool:

@@ -1,11 +1,12 @@
 # Autolife HG-DAgger
 
-这是一个独立于 `openarmx_teleop_vr_306_v4` 的 ROS 2 Python 包。它只使用原 VR 包公开的 topic、service 和参数，不修改原包源码，也不直接发布机器人厂商控制 topic。
+这是一个独立的 ROS 2 Python 仲裁包。运动链只使用 `openarmx_teleop_vr_306_v4` 公开的 topic、service 和参数，不直接发布机器人厂商控制 topic。为显示 HD-DAGGER 中文 HUD 与区分 B 短按/长按，网页前端有小范围集成；原 VR mapper/controller 的运动逻辑不变。
 
 ## 第一阶段能力
 
 - VLA joint action 与 VR expert action 的单点控制权仲裁。
-- `POLICY_ACTIVE → FAILURE_HOLD → EXPERT_RELEASE_REQUIRED → EXPERT_READY → EXPERT_ACTIVE → POLICY_WARMUP` 状态机。
+- `POLICY_STOPPED → POLICY_WARMUP → POLICY_ACTIVE → FAILURE_HOLD → EXPERT_RELEASE_REQUIRED → EXPERT_READY → EXPERT_ACTIVE → POLICY_WARMUP` 状态机。
+- 网页使能后默认保持 `POLICY_STOPPED`，不会请求 THOR 推理。双 Grip 松开时长按右 A 1.2 秒进入 VLA warmup；在 VLA 预热或控制期间长按右 B 1.2 秒立即保持机器人并返回 `POLICY_STOPPED`。短按 B 仍保留原有视角切换。
 - 长按 Y 交还后，VLA warmup 与 RGBD 视频编码并行；warmup 连续输出稳定后恢复策略，采集器在后台完成 manifest ACK，避免长片段编码阻塞控制状态。
 - 在 `EXPERT_RELEASE_REQUIRED`、`EXPERT_READY`，或双 Grip 已松开的 `EXPERT_ACTIVE` 中，长按左 X + 右 A 1 秒可请求原控制器的碰撞检查快速复位。复位全程仍经过 HG-DAgger 仲裁，完成后必须重新按 Grip 锚定；含复位运动的 intervention 会被标记为不可训练并丢弃。
 - 接管前向 controller 发双臂 `release_hold`，等待 controller 报告 `HOLDING` 后才允许 VR 目标通过。
@@ -16,6 +17,7 @@
 - Grip 请求接管；双 Grip 松开时长按 Y 返回 policy warmup。当前固定为 RGBD，Y 短按切换已锁定。
 - 初版 policy 恢复预热：连续 6 个动作、至少 0.2 秒，并检查与当前 applied action 的跳变。
 - 单条 episode 包含失败前默认 5 秒同步 RGBD 前缀和接管后的 expert 段；manifest/trace 记录失败边界，start/save/discard 均要求 collector 的 request ID 确认。
+- collector 后台原子提交成功后，VR 顶部 HUD 显示“当前纠正片段已保存”、episode index 和实际帧数；在 manifest/Parquet/视频完整落盘前不会提前报成功。
 - 30 Hz 发布 `/hg_dagger/collector/action`，动作顺序与 GR00T N1.7 严格一致：
   左臂 7 + 右臂 7 + 左右夹爪 + 颈部 3 + 上腰 pitch/yaw，共 21 维。
 
@@ -168,6 +170,7 @@ HD-DAGGER 仅从旧 collector 目录导入共享的相机/时序工具和 contro
 仓库 recorder 不是 atomic 版就拒绝启动。
 
 路径必须为绝对路径且可写；可以选择 NAS 挂载点，也可以在测试阶段显式选择本机目录。默认值为 `/home/ubuntu/hg_dagger_data`。
+`TASK_NAME` 就是 `data_root` 下的自定义批次文件夹名，为避免路径歧义，仅允许字母、数字、`.`、`_`和 `-`。例如 `data_root=/home/ubuntu/nas`、`TASK_NAME=hd300_acceptance_p2_01`时，数据集位于 `/home/ubuntu/nas/hd300_acceptance_p2_01/hg_dagger_rgbd/atomic_dataset_v1`。
 
 collector 在等待失败期间维护同步 RGBD 环形缓存；接管 `start` 成功后，缓存前缀先进入同一个 LeRobot episode。若 episode 最终保存，失败前图像、状态和已仲裁动作会和后续 VR expert 数据一起落盘；若放弃则整条 episode 一并清除。
 

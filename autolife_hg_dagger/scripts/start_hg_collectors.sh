@@ -20,6 +20,10 @@ if [ -z "${task_name}" ]; then
   echo "Usage: $0 TASK_NAME [TASK_TEXT] [DATA_ROOT]" >&2
   exit 2
 fi
+if [[ ! "${task_name}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+  echo "ERROR: TASK_NAME must use letters, digits, '.', '_' or '-' and may not contain '/': ${task_name}" >&2
+  exit 2
+fi
 if [[ "${data_root}" != /* ]]; then
   echo "ERROR: DATA_ROOT must be an absolute path: ${data_root}" >&2
   exit 3
@@ -199,4 +203,6 @@ start_one rgbd 1 4
 echo "RGBD collector is continuously buffering synchronized pre-roll frames in paused mode."
 echo "It creates an episode only after an HG-DAGGER 'start' command."
 echo "Use the same path in launch: data_root:=${data_root} task_name:=${task_name}"
+echo "Dataset root: ${data_root}/${task_name}/hg_dagger_rgbd/atomic_dataset_v1"
+echo "Sidecar root: ${data_root}/${task_name}/hg_dagger_sidecar"
 echo "Robot ID=${robot_id}, topic suffix=${topic_suffix}"

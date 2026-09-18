@@ -3,6 +3,8 @@ hg_dagger_supervisor:
     default_depth_enabled: true
     rgbd_only: true
     y_long_press_seconds: 1.2
+    policy_button_hold_seconds: 1.2
+    hud_save_notice_seconds: 5.0
     xa_reset_hold_seconds: 1.0
     xa_reset_timeout_sec: 25.0
     hold_confirmation_timeout_sec: 1.0
