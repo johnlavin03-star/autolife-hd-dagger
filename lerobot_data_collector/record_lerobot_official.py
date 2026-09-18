@@ -492,6 +492,7 @@ class OfficialLeRobotRecorder(Node):
         self.sync_reference_camera: str | None = None
         self.last_reference_stamp_sec: float | None = None
         self.last_episode_anchor_stamp_sec: float | None = None
+        self.consecutive_reference_interval_errors = 0
         self.episode_invalid = False
         self.episode_invalid_reason: str | None = None
         self.state_ready_written = False
@@ -1410,6 +1411,7 @@ class OfficialLeRobotRecorder(Node):
                 buffer.clear()
             self.last_reference_stamp_sec = None
             self.last_episode_anchor_stamp_sec = None
+            self.consecutive_reference_interval_errors = 0
             self._log_sync({
                 "event": "pre_roll_reset",
                 "reason": reason,
@@ -1450,13 +1452,31 @@ class OfficialLeRobotRecorder(Node):
             "press S or D to discard it before starting again"
         )
 
-    def _consume_image_sample(self, camera_name: str, selected: ImageSample) -> None:
-        """Remove one matched frame and all older frames from a camera FIFO."""
+    def _consume_image_sample(
+        self,
+        camera_name: str,
+        selected: ImageSample,
+        *,
+        retain_selected: bool = False,
+    ) -> None:
+        """Prune a camera FIFO after a successful match.
+
+        The reference stream defines one unique dataset tick, so its selected
+        frame is consumed.  Auxiliary cameras may run at a lower effective rate
+        or arrive with a stable pipeline phase offset.  Keeping their most
+        recently selected sample lets the next reference tick choose whichever
+        of that frame and the next arriving frame is actually nearest.  Always
+        consuming it biased matching toward a future frame on robot 300 and
+        produced false 40--57 ms synchronization failures.
+        """
 
         buffer = self.image_buffers[camera_name]
         while buffer:
-            if buffer.popleft() is selected:
+            if buffer[0] is selected:
+                if not retain_selected:
+                    buffer.popleft()
                 return
+            buffer.popleft()
 
     def _wait_for_camera_buffers(self, now: float) -> bool:
         """Wait for every active camera to contribute its next FIFO sample.
@@ -1558,14 +1578,30 @@ class OfficialLeRobotRecorder(Node):
                 float(self.args.fps),
             )
             if interval_error_ratio > self.args.max_frame_interval_error_ratio:
-                self._invalidate_episode(
-                    "reference_frame_interval",
-                    now,
-                    interval_ms=frame_interval_ms,
-                    expected_interval_ms=expected_interval * 1000.0,
-                    interval_error_ratio=interval_error_ratio,
-                )
-                return
+                self.consecutive_reference_interval_errors += 1
+                if (
+                    self.consecutive_reference_interval_errors
+                    > self.args.max_consecutive_reference_interval_errors
+                ):
+                    self._invalidate_episode(
+                        "reference_frame_interval",
+                        now,
+                        interval_ms=frame_interval_ms,
+                        expected_interval_ms=expected_interval * 1000.0,
+                        interval_error_ratio=interval_error_ratio,
+                        consecutive_errors=self.consecutive_reference_interval_errors,
+                    )
+                    return
+                self._log_sync({
+                    "event": "reference_frame_interval_tolerated",
+                    "wall_time": now,
+                    "interval_ms": frame_interval_ms,
+                    "expected_interval_ms": expected_interval * 1000.0,
+                    "interval_error_ratio": interval_error_ratio,
+                    "consecutive_errors": self.consecutive_reference_interval_errors,
+                })
+            else:
+                self.consecutive_reference_interval_errors = 0
 
         state_before, state_after = surrounding_samples(self.state_buffer, anchor_sec)
         state_stamps = [sample.stamp_sec for sample in self.state_buffer]
@@ -1760,7 +1796,11 @@ class OfficialLeRobotRecorder(Node):
             # causality checks used for ordinary episode frames.
             self.pre_roll_frames.append((frame, anchor_sec))
         for camera_name, image_sample in matched_images.items():
-            self._consume_image_sample(camera_name, image_sample)
+            self._consume_image_sample(
+                camera_name,
+                image_sample,
+                retain_selected=camera_name != reference_name,
+            )
         self.last_reference_stamp_sec = anchor_sec
         self.last_episode_anchor_stamp_sec = anchor_sec
         if not self.is_recording:
@@ -1813,6 +1853,7 @@ class OfficialLeRobotRecorder(Node):
         self.episode_invalid = False
         self.episode_invalid_reason = None
         self.last_episode_anchor_stamp_sec = None
+        self.consecutive_reference_interval_errors = 0
         self.reported_image_overflows.clear()
 
     def _acquire_motion_lock(self) -> bool:
@@ -2587,6 +2628,16 @@ def parse_args() -> argparse.Namespace:
         help="Maximum relative error of the reference-camera frame interval compared with the requested 1/FPS period.",
     )
     parser.add_argument(
+        "--max-consecutive-reference-interval-errors",
+        type=int,
+        default=1,
+        help=(
+            "Number of isolated reference-camera interval errors tolerated before "
+            "invalidating an episode. The default accepts one dropped source frame "
+            "but still rejects a continuing timing failure."
+        ),
+    )
+    parser.add_argument(
         "--sync-image-buffer-size", type=int, default=DEFAULT_SYNC_IMAGE_BUFFER_SIZE,
         help="Maximum number of recent frames kept per camera in the image FIFO. Overflow invalidates the active episode.",
     )
@@ -2678,6 +2729,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--max-action-hold-sec must be positive")
     if not 0 < args.max_frame_interval_error_ratio < 1:
         parser.error("--max-frame-interval-error-ratio must be between 0 and 1")
+    if args.max_consecutive_reference_interval_errors < 0:
+        parser.error("--max-consecutive-reference-interval-errors must be non-negative")
     if args.sync_image_buffer_size < 2 or args.sync_signal_buffer_size < 2:
         parser.error("synchronization buffer sizes must be at least 2")
 

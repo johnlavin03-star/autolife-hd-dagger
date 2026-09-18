@@ -127,6 +127,7 @@ start_one() {
   # rejects genuinely stale cameras.  Both values remain operator-tunable.
   local sync_reference_camera="${HG_DAGGER_SYNC_REFERENCE_CAMERA:-rgbd_head_color}"
   local max_sync_delta_sec="${HG_DAGGER_MAX_SYNC_DELTA_SEC:-0.05}"
+  local max_consecutive_reference_interval_errors="${HG_DAGGER_MAX_CONSECUTIVE_REFERENCE_INTERVAL_ERRORS:-1}"
   local dataset_fps="${HG_DAGGER_DATASET_FPS:-${default_dataset_fps}}"
 
   if ! grep -q "HG-DAGGER atomic episode store" "${recorder}"; then
@@ -163,6 +164,7 @@ start_one() {
     --min-cameras "${min_cameras}"
     --sync-reference-camera "${sync_reference_camera}"
     --max-sync-delta-sec "${max_sync_delta_sec}"
+    --max-consecutive-reference-interval-errors "${max_consecutive_reference_interval_errors}"
     --max-image-age-sec 0.15
     --max-state-age-sec 0.15
     --max-state-interpolation-gap-sec 0.05
