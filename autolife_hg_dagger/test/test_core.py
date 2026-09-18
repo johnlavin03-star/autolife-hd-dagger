@@ -83,7 +83,7 @@ def test_invalid_policy_action(action):
 def test_vr_gestures_from_existing_web_payload():
     packet = {
         "leftController": {"gripActive": True, "xButton": 1, "yButton": 1},
-        "rightController": {"gripActive": False, "aButton": 1},
+        "rightController": {"gripActive": False, "aButton": 0},
     }
     assert grip_snapshot(packet) == (True, False)
     assert left_y_snapshot(packet)
