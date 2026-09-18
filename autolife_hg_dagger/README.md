@@ -134,6 +134,9 @@ https://<robot-ip>:8446/vr_monitor.html
 监看页只读取头部 RGBD 彩色流、VR/XR 连接状态、手柄追踪、传输延迟和
 HD-DAGGER HUD；它不建立控制 WebSocket，不能使能或向机器人发指令，因此不会抢占头显控制权。
 
+`launch_hg_dagger.sh` 在 `dry_run:=false` 时还会校验当前 `task_name` 与
+`data_root` 对应的 RGBD collector PID、数据集路径和 FIFO；旧任务的 collector 不能代替当前任务，防止实机运行后才发现没有记录。
+
 启用 THOR 前设置 `HG_DAGGER_START_GROOT=true`；wrapper 会额外检查 token 权限和
 THOR `/health`。`policy_timeout_sec:=30.0` 只用于纯 VR 调试，正式 VLA 联调恢复为
 默认 `0.25` 秒。不要同时运行桌面端 `full_vr_navigation.launch.py` 与本 launch。
