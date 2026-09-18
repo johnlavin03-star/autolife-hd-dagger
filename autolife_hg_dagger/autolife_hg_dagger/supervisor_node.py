@@ -982,6 +982,20 @@ class HgDaggerSupervisor(Node):
             and not self._intervention_reset_used
             and self._intervention_failure_context_valid
         )
+        discard_reasons = []
+        if requested_save and self._expert_command_count < minimum:
+            discard_reasons.append(
+                f"insufficient_expert_commands:{self._expert_command_count}<{minimum}"
+            )
+        if requested_save and self._intervention_reset_used:
+            discard_reasons.append("quick_reset_used")
+        if requested_save and not self._intervention_failure_context_valid:
+            discard_reasons.append("failure_context_unavailable")
+        finish_reason = (
+            reason
+            if not discard_reasons else
+            reason + "; discarded: " + ",".join(discard_reasons)
+        )
         command_name = "collector_save_command" if save else "collector_discard_command"
         result = None
         if save and self._recorder_active:
@@ -1000,7 +1014,7 @@ class HgDaggerSupervisor(Node):
                 manifest_path = self._trace.finish(
                     "collector_save_pending",
                     self._expert_command_count,
-                    reason,
+                    finish_reason,
                     pending_result,
                 )
                 self._collector_finalize_pending += 1
@@ -1010,7 +1024,7 @@ class HgDaggerSupervisor(Node):
                     target=self._finalize_collector_save,
                     args=(
                         self._active_depth, command, request_id, manifest_path,
-                        self._expert_command_count, reason,
+                        self._expert_command_count, finish_reason,
                     ),
                     name="hg-dagger-collector-finalize",
                     daemon=True,
@@ -1044,12 +1058,12 @@ class HgDaggerSupervisor(Node):
         self._trace.finish(
             status,
             self._expert_command_count,
-            reason,
+            finish_reason,
             None if result is None else result.as_dict(),
         )
         self._event(
             "intervention_finished",
-            reason,
+            finish_reason,
             status=status,
             frame_count=self._expert_command_count,
             collector_acknowledged=bool(result and result.acknowledged),
