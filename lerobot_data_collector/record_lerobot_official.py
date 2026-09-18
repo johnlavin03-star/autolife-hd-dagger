@@ -80,7 +80,6 @@ from time_sync import (
     latest_at_or_before,
     linear_interpolation_alpha,
     nearest_sample,
-    oldest_ready_sample,
     payload_timestamp_sec,
     surrounding_samples,
 )
@@ -128,6 +127,43 @@ class TimedSample:
     value: Any
     stamp_sec: float
     received_sec: float
+
+
+def rate_matched_reference_sample(
+    samples: Any,
+    *,
+    now_sec: float,
+    wait_sec: float,
+    after_stamp_sec: float | None,
+    fps: float,
+    max_interval_error_ratio: float,
+) -> Any:
+    """Select a reference frame at the requested dataset rate.
+
+    Robot 300's head RGB SHM stream is approximately 60 Hz while the training
+    dataset is 30 Hz.  FIFO-oldest selection consumes every camera frame and
+    then incorrectly rejects the resulting ~16.7 ms interval against a 33.3
+    ms dataset period.  Select the ready frame nearest the next 30 Hz target
+    and let the existing FIFO consumption drop the skipped source frames.
+    """
+    ready = [
+        sample for sample in samples
+        if now_sec - sample.received_sec >= wait_sec
+        and (after_stamp_sec is None or sample.stamp_sec > after_stamp_sec)
+    ]
+    if not ready:
+        return None
+    if after_stamp_sec is None:
+        return min(ready, key=lambda sample: sample.stamp_sec)
+    expected = 1.0 / float(fps)
+    target = after_stamp_sec + expected
+    earliest_acceptable = target - expected * float(max_interval_error_ratio)
+    candidates = [
+        sample for sample in ready if sample.stamp_sec >= earliest_acceptable
+    ]
+    if not candidates:
+        return None
+    return min(candidates, key=lambda sample: abs(sample.stamp_sec - target))
 
 
 @dataclass(frozen=True)
@@ -1480,11 +1516,15 @@ class OfficialLeRobotRecorder(Node):
             return
         if self._wait_for_camera_buffers(now):
             return
-        reference = oldest_ready_sample(
+        reference = rate_matched_reference_sample(
             self.image_buffers[reference_name],
             now_sec=now,
             wait_sec=max(self.args.max_sync_delta_sec, self.args.max_state_interpolation_gap_sec),
             after_stamp_sec=self.last_reference_stamp_sec,
+            fps=float(self.args.fps),
+            max_interval_error_ratio=float(
+                self.args.max_frame_interval_error_ratio
+            ),
         )
         if reference is None:
             latest_reference = self.image_buffers[reference_name][-1]

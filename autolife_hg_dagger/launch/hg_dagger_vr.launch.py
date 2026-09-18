@@ -195,7 +195,7 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument("groot_task", default_value="Pick the laundry bag."),
         DeclareLaunchArgument(
-            "groot_max_inference_latency_sec", default_value="1.0",
+            "groot_max_inference_latency_sec", default_value="2.5",
             description="Fail over to VR when one GR00T start/infer/retry reaches this latency; <=0 disables.",
         ),
         DeclareLaunchArgument(

@@ -65,7 +65,7 @@ fi
 if [ "$start_groot" = "true" ]; then
   echo "INFO  GR00T bridge will start IDLE behind HG-DAGGER authority."
   echo "INFO  Enabling the VR session leaves VLA stopped and the robot holding."
-  echo "INFO  Inference begins only after the operator releases both Grips and long-presses A."
+  echo "INFO  Inference begins only after the operator releases both Grips, long-presses X, and releases X."
 fi
 
 exec ros2 launch autolife_hg_dagger hg_dagger_vr.launch.py \

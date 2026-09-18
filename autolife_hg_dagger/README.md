@@ -84,9 +84,9 @@ ros2 launch autolife_hg_dagger hg_dagger_vr.launch.py \
 `start_groot_bridge` 默认保持 `false`，避免 token 尚未配置时破坏纯 VR/dry-run
 启动。也可通过进程环境变量 `GROOT_REMOTE_TOKEN` 注入，不会在状态或日志中输出。
 
-`groot_max_inference_latency_sec` 默认是 `1.0` 秒。任一 `/start`、`/infer`
+`groot_max_inference_latency_sec` 默认是 `2.5` 秒。任一 `/start`、`/infer`
 或 `/retry` 达到该阈值，即按 VLA 失败进入 VR 接管；设置为小于等于零可关闭。
-当前 300 历史记录中的 baseline 往返通常约为 0.25–0.44 秒。
+300 实测 baseline 往返约为 1.1–1.9 秒，因此 1.0 秒会把正常推理随机判为失败。
 
 HG collector 现在只启动 RGBD 版本，并在暂停期间持续组装默认 5 秒的同步
 pre-roll。失败触发时 supervisor 立即执行带 ACK 的 `start`，把该时刻的 pre-roll

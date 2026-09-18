@@ -80,7 +80,7 @@ class GrootPolicyBridge(Node):
             "token_file": "/home/ubuntu/.config/autolife_hg_dagger/groot_server.token",
             "task": "Pick the laundry bag.",
             "request_timeout_sec": 180.0,
-            "max_inference_latency_sec": 1.0,
+            "max_inference_latency_sec": 2.5,
             "action_rate_hz": 30.0,
             "forward_ack_timeout_sec": 0.25,
             "max_state_age_sec": 0.5,
@@ -304,6 +304,14 @@ class GrootPolicyBridge(Node):
                 self.get_logger().warning(f"stale proposal discard returned: {exc}")
         self._post("/close", {"session_id": session_id})
         self._clear_remote_lease()
+        # Recovery may run after a failed generation while the in-memory
+        # bridge still carries the session that has just been closed.  Clear
+        # it here so the next request uses /start rather than /infer against a
+        # session that no longer exists.
+        if self._session_id == session_id:
+            self._session_id = ""
+        self._proposal = None
+        self._executed = []
         self.get_logger().warning(
             f"recovered interrupted THOR session {session_id} from local lease"
         )
@@ -432,6 +440,8 @@ class GrootPolicyBridge(Node):
         if isinstance(proposal, Mapping):
             # Persist before latency validation or execution.  Both paths may
             # throw, and the remote proposal must still be recoverable then.
+            self._proposal = dict(proposal)
+            self._executed = []
             self._write_remote_lease(proposal)
 
     def _next_response(self, observation: Mapping[str, Any]) -> dict[str, Any]:
