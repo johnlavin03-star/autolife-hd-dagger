@@ -45,6 +45,11 @@ conflicts="$(pgrep -af "$conflict_pattern" || true)"
 if [ -n "$conflicts" ]; then
   fail "another VR/HG control stack is running:"
   printf '%s\n' "$conflicts" >&2
+  if printf '%s\n' "$conflicts" | grep -qE 'whole_body_joint_control.launch.py|whole_body_joint_bridge'; then
+    echo "INFO  Close Whole Body Joint Control in Control Center first." >&2
+    echo "INFO  After confirming nobody is using it, run:" >&2
+    echo "INFO    bash $(dirname "$0")/stop_competing_joint_control.sh --robot-id ${robot_id} --confirm" >&2
+  fi
 else
   pass "no competing VR/HG controller process"
 fi

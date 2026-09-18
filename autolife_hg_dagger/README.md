@@ -116,6 +116,24 @@ bash /home/ubuntu/ros2_ws/src/autolife-hd-dagger/autolife_hg_dagger/scripts/laun
   policy_timeout_sec:=30.0
 ```
 
+如果预检发现 Control Center 启动的 `whole_body_joint_control`，应优先在
+Control Center 界面关闭 Whole Body Joint Control。确认无人使用机械臂后，也可运行严格按
+robot ID 匹配、只发 SIGINT 且不使用 SIGKILL 的辅助脚本：
+
+```bash
+bash /home/ubuntu/ros2_ws/src/autolife-hd-dagger/autolife_hg_dagger/scripts/stop_competing_joint_control.sh \
+  --robot-id 300 --confirm
+```
+
+头显进入 VR 后，可在另一台电脑或机器人桌面浏览器打开同端口只读监看页：
+
+```text
+https://<robot-ip>:8446/vr_monitor.html
+```
+
+监看页只读取头部 RGBD 彩色流、VR/XR 连接状态、手柄追踪、传输延迟和
+HD-DAGGER HUD；它不建立控制 WebSocket，不能使能或向机器人发指令，因此不会抢占头显控制权。
+
 启用 THOR 前设置 `HG_DAGGER_START_GROOT=true`；wrapper 会额外检查 token 权限和
 THOR `/health`。`policy_timeout_sec:=30.0` 只用于纯 VR 调试，正式 VLA 联调恢复为
 默认 `0.25` 秒。不要同时运行桌面端 `full_vr_navigation.launch.py` 与本 launch。
