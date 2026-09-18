@@ -76,4 +76,3 @@ if pgrep -f "$pattern" >/dev/null; then
 fi
 
 echo "Competing Control Center launch stopped cleanly for robot ${robot_id}."
-
